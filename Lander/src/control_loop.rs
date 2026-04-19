@@ -12,6 +12,7 @@ pub struct ControlLoop {
     lossless: Lossless,
     mpc: MPC,
     state: ControlLoopState,
+    goal: [f64; 3],
     sensor_fusion_rate: f64,
     navigation_rate: f64,
     mpc_rate: f64,
@@ -30,6 +31,7 @@ impl ControlLoop {
             lossless,
             mpc,
             state: ControlLoopState::default(),
+            goal: [0.0, 0.0, 50.0],
             sensor_fusion_rate: 500.0,  // 500 Hz
             navigation_rate: 1.0,       // 1 Hz
             mpc_rate: 50.0,              // 50 Hz
@@ -43,7 +45,7 @@ impl ControlLoop {
         self.state.last_sensor_update = now;
         self.state.last_navigation_update = now;
         self.state.last_mpc_update = now;
-                
+
         println!("Control loop initialized");
     }
     
@@ -51,8 +53,7 @@ impl ControlLoop {
         &self.state
     }
     
-    // TODO: Add Phase Changes and Goal Updates
-    pub fn step(&mut self, sensor_data: &SensorData, goal_position: [f64; 3]) -> Option<[f64; 3]> {
+    pub fn step(&mut self, sensor_data: &SensorData) -> Option<[f64; 3]> {
         if self.state.flight_terminated {
             return None;
         }
@@ -66,6 +67,8 @@ impl ControlLoop {
         
         // Update sensor fusion (500 Hz)
         self.update_sensor_fusion(sensor_data);
+
+        self.determine_flight_phase();
         
         // Update navigation (1 Hz)
         self.update_navigation(goal_position);
@@ -97,34 +100,34 @@ impl ControlLoop {
         false
     }
     
-    fn update_navigation(&mut self, goal_position: [f64; 3]) {
+    fn update_navigation(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.state.last_navigation_update) >= Duration::from_secs_f64(1.0 / self.navigation_rate) {
-            let current_pos = self.state.vehicle_state.position;
-            let current_vel = self.state.vehicle_state.velocity;
-            let propellant_mass = self.state.vehicle_state.mass - self.state.vehicle_state.dry_mass;
-            let system_time = self.state.start_time.elapsed().as_secs_f64();
-            
-            // Update lossless convexification for trajectory
-            let trajectory = self.lossless.update(
-                [current_pos.x, current_pos.y, current_pos.z],
-                [current_vel.x, current_vel.y, current_vel.z],
-                goal_position,
-                propellant_mass,
-                system_time
-            );
-            
-            self.state.trajectory_state = Some(trajectory);
-            self.state.last_navigation_update = now;
+            match self.flight_phase {
+                FlightPhase::PreLaunch => {
+                    if self.state.trajectory_state.is_none() {
+                        self.generate_ascent_trajectory();
+                    }
+                }
+                FlightPhase::Ascent => {
+                    self.generate_ascent_trajectory();
+                }
+                FlightPhase::Descent => {
+                    self.generate_descent_trajectory();
+                }
+                FlightPhase::Landed => {
+                    // Do nothing
+                }
+            }
         }
     }
     
     fn update_mpc(&mut self) -> Option<[f64; 3]> {
         let now = Instant::now();
         if now.duration_since(self.state.last_mpc_update) >= Duration::from_secs_f64(1.0 / self.mpc_rate) {
-            if let (Some(sensor_state), Some(trajectory)) = (&self.state.sensor_fusion_state, &self.state.trajectory_state) {
+            if let Some(trajectory) = &self.state.trajectory_state {
                 // Convert vehicle state to MPC format
-                let mpc_state = self.vehicle_state_to_mpc_state(&Some(sensor_state.clone()));
+                let mpc_state = self.vehicle_state_to_mpc_state(&self.state.trajectory_state);
                 
                 // Generate reference trajectory
                 let (xref_traj, uref_traj) = self.generate_mpc_reference(trajectory);
@@ -150,7 +153,8 @@ impl ControlLoop {
         match self.state.flight_phase {
             FlightPhase::Ascent => {
                 // Transition to hover when reaching target altitude
-                if current_altitude >= goal_altitude * 0.95 {
+                if current_altitude >= goal_altitude{
+                    self.state.last_state_time = Instant::now();
                     FlightPhase::Hover
                 } else {
                     FlightPhase::Ascent
@@ -159,6 +163,7 @@ impl ControlLoop {
             FlightPhase::Hover => {
                 // Hover for 20 seconds in this phase, then transition to descent
                 if self.state.last_state_time.elapsed().as_secs_f64() >= 20.0 {
+                    self.state.last_state_time = Instant::now();
                     FlightPhase::Descent
                 } else {
                     FlightPhase::Hover
@@ -166,7 +171,21 @@ impl ControlLoop {
             },
             FlightPhase::Descent => {
                 // Stay in descent until landing
-                FlightPhase::Descent
+                if self.state.vehicle_state.position.z <= 0.0 {
+                    FlightPhase::Landed
+                } else {
+                    FlightPhase::Descent
+                }
+            }
+            FlightPhase::PreLaunch => {
+                // Stay in initialized until we start the flight
+                // TODO: Change this logic to transition to Ascent when we're ready to start
+                if self.state.last_state_time.elapsed().as_secs_f64() >= 20.0 {
+                    self.state.last_state_time = Instant::now();
+                    FlightPhase::Ascent
+                } else {
+                    FlightPhase::PreLaunch
+                }
             }
         }
     }
@@ -174,7 +193,7 @@ impl ControlLoop {
     fn generate_ascent_trajectory(&mut self) {
         let current_pos = self.state.vehicle_state.position;
         let current_vel = self.state.vehicle_state.velocity;
-        let goal_position = [0.0, 0.0, 50.0]; // Target 50m altitude
+        let goal_position =  // Target 50m altitude
         let propellant_mass = self.state.vehicle_state.mass - self.state.vehicle_state.dry_mass;
         let system_time = self.state.start_time.elapsed().as_secs_f64();
         
@@ -218,8 +237,12 @@ impl ControlLoop {
         }
         
         // 2. GPS/UWB failure - terminate if no position data for 5 seconds
-        if sensor_data.gps_data.is_none() {
+        if sensor_data.uwb_data.is_none() {
             // TODO: Add timeout check
+            return true;
+        } else if sensor_data.gps_data.is_none() {
+            // TODO: Add timeout check
+            // Attempt Landing
             return true;
         }
         

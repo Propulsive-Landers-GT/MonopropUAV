@@ -9,27 +9,26 @@ fn main() {
     
     let mut control_loop = ControlLoop::new();
     control_loop.initialize();
-    
-    let goal_position = [0.0, 0.0, 50.0]; // Target 50m altitude
         
-    println!("Control loop running at 500 Hz...");
+    println!("Control loop running...");
     
     // TODO: Timing Controls for Multithreaded Loop
     loop {
-        
-        // Initialize sensor readings (would come from actual sensors)
-        let sensor_data = SensorData {
+        // Initialize sensor readings
+        let mut sensor_data = SensorData {
             timestamp: control_loop.get_state().start_time.elapsed().as_secs_f64(),
             imu_data: None,
-            barometer_data: None,
-            magnetometer_data: None,
             gps_data: None,
+            uwb_data: None,
             chamber_pressure: None,
             tank_pressure: None,
         };
         
+        // TODO: This isn't implemented yet, but we need to get sensor data from the hardware
+        update_sensor_data(&mut sensor_data);
+        
         // Step the control loop
-        if let Some(control_output) = control_loop.step(&sensor_data, goal_position) {
+        if let Some(control_output) = control_loop.step(&sensor_data) {
             if control_loop.get_state().flight_terminated {
                 println!("Flight terminated - zeroing controls");
                 break;
@@ -47,6 +46,9 @@ fn main() {
                 control_loop.get_state().vehicle_state.position.z,
                 control_loop.get_state().flight_phase
             );
+        }
+        if control_loop.get_state().flight_phase == algorithms::FlightPhase::Landed {
+            break;
         }
     }
     

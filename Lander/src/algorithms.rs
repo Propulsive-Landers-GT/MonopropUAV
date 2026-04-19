@@ -303,6 +303,7 @@ impl Lossless {
 // Sensor Fusion implementation
 pub struct SensorFusion {
     ekf_attitude: ExtendedKalmanFilter<AttitudeModel>,
+    // TODO: Need EKFs for GPS and UWB as well
     sensor_fusion_rate: f64,
     last_update: Option<Instant>,
 }
@@ -326,7 +327,15 @@ impl SensorFusion {
         }
     }
     
-    pub fn update(&mut self, sensor_data: &SensorData, dt: f64) -> Option<Array1<f64>> {
+    /// Run the EKF prediction and update steps for every available filter
+    /// 
+    /// # Arguments
+    /// * `sensor_data` - The SensorData struct containing all sensor readings
+    /// * `dt` - The time step
+    /// 
+    /// # Returns
+    /// * `Option<VehicleState>` - The fused vehicle state, or None if not enough data
+    pub fn update(&mut self, sensor_data: &SensorData, dt: f64) -> Option<VehicleState> {
         let now = Instant::now();
         
         // Rate limiting: only update at specified frequency
@@ -336,6 +345,9 @@ impl SensorFusion {
             }
         }
         self.last_update = Some(now);
+
+        let mut new_state = VehicleState::default();
+        // TODO: update mass based on fuel consumption
         
         // Update EKF with IMU data if available
         if let Some(imu_data) = &sensor_data.imu_data {
@@ -346,16 +358,40 @@ impl SensorFusion {
             let measurement = [
                 imu_data.accel[0], imu_data.accel[1], imu_data.accel[2], // Accelerometer
                 imu_data.gyro[0], imu_data.gyro[1], imu_data.gyro[2],          // Gyroscope
+                imu_data.mag[0], imu_data.mag[1], imu_data.mag[2], // Magnetometer
             ];
             
             self.ekf_attitude.update(&measurement);
             let updated_state = self.ekf_attitude.get_state();
             
-            if updated_state.len() == 6 {
-                return Some(Array1::from_vec(updated_state.to_vec()));
-            }
+            new_state.attitude = UnitQuaternion::from_euler_angles(updated_state[0], updated_state[1], updated_state[2]);
+            new_state.angular_velocity = Vector3::new(updated_state[3], updated_state[4], updated_state[5]);
         }
-        
+
+        if let Some(uwb_data) = &sensor_data.uwb_data {
+            // TODO: Update UWB EKF
+            // self.ekf_uwb_position.predict();
+            // self.ekf_uwb_position.update(&[uwb_data]);
+
+            // let updated_state = self.ekf_uwb_position.get_state();
+
+            // Placeholder until UWB EKF is implemented
+            let updated_state = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            new_state.position = Vector3::new(updated_state[0], updated_state[1], updated_state[2]);
+            new_state.velocity = Vector3::new(updated_state[3], updated_state[4], updated_state[5]);
+
+        } else if let Some(gps_data) = &sensor_data.gps_data {
+            // TODO: Update GPS EKF
+            // self.ekf_gps_position.predict();
+            // self.ekf_gps_position.update(&[gps_data]);
+
+            // let updated_state = self.ekf_gps_position.get_state();
+
+            // Placeholder until GPS EKF is implemented
+            let updated_state = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            new_state.position = Vector3::new(updated_state[0], updated_state[1], updated_state[2]);
+            new_state.velocity = Vector3::new(updated_state[3], updated_state[4], updated_state[5]);
+        }
         None
     }
 }
@@ -365,9 +401,8 @@ impl SensorFusion {
 pub struct SensorData {
     pub timestamp: f64,
     pub imu_data: Option<ImuData>,
-    pub barometer_data: Option<f64>, // Pressure altitude
-    pub magnetometer_data: Option<[f64; 3]>, // Magnetic field
-    pub gps_data: Option<GpsData>,
+    pub gps_data: Option<[f64; 3]>,
+    pub uwb_data: Option<[f64; 3]>, // Ultra-wideband position
     pub chamber_pressure: Option<f64>,
     pub tank_pressure: Option<f64>,
 }
@@ -376,23 +411,17 @@ pub struct SensorData {
 pub struct ImuData {
     pub accel: [f64; 3],    // Accelerometer measurements [x, y, z]
     pub gyro: [f64; 3],     // Gyroscope measurements [wx, wy, wz]
-    pub temperature: f64, // Temperature
-}
-
-#[derive(Debug, Clone)]
-pub struct GpsData {
-    pub position: [f64; 3],    // GPS position [x, y, z]
-    pub velocity: [f64; 3],    // GPS velocity [vx, vy, vz]
-    pub accuracy: f64,       // GPS accuracy in meters
-    pub satellites: u8,     // Number of satellites
+    pub mag: [f64; 3],      // Magnetometer measurements [mx, my, mz]
 }
 
 // Vehicle state data structures
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FlightPhase {
+    PreLaunch,
     Ascent,
     Hover,
     Descent,
+    Landed
 }
 
 #[derive(Debug, Clone)]
@@ -434,11 +463,11 @@ impl Default for ControlLoopState {
                 velocity: Vector3::new(0.0, 0.0, 0.0),
                 attitude: UnitQuaternion::identity(),
                 angular_velocity: Vector3::new(0.0, 0.0, 0.0),
-                mass: 10.0,
-                dry_mass: 10.0,
+                mass: 80.0,
+                dry_mass: 50.0,
             },
             flight_terminated: false,
-            flight_phase: FlightPhase::Ascent,
+            flight_phase: FlightPhase::PreLaunch,
             last_state_time: now,
         }
     }
