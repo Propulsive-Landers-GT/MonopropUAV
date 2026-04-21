@@ -6,7 +6,7 @@ import re
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional, List
+from typing import Callable, Dict, Tuple, Optional, List
 
 import numpy as np
 import CoolProp.CoolProp as CP
@@ -1512,10 +1512,12 @@ class PIDController:
         else:
             derivative = (error - self.prev_error) / dt
 
+        # Compute unsaturated output using the current (pre-update) integral so that
+        # the anti-windup check can reference it before deciding whether to accumulate.
+        u_unsat = self.kp * error + self.ki * self.integral + self.kd * derivative
+
         integral_candidate = self.integral + error * dt
         integral_candidate = float(np.clip(integral_candidate, self.integral_min, self.integral_max))
-
-        u_unsat = self.kp * error + self.ki * integral_candidate + self.kd * derivative
 
         pushing_high = (u_unsat > self.output_max) and (error > 0.0)
         pushing_low = (u_unsat < self.output_min) and (error < 0.0)
@@ -2151,9 +2153,11 @@ def plot_time_history(history: Dict[str, list]) -> None:
     axs[5].grid(True)
     axs[5].legend()
 
-    axs[6].plot(t, arr("angle_pct"), label="Valve cmd")
-    axs[6].plot(t, arr("angle_ff_pct"), "--", label="Valve FF")
-    axs[6].plot(t, arr("angle_trim_pct"), ":", label="Valve PID trim")
+    axs[6].plot(t, arr("angle_pct"), label="Valve actual (servo out)")
+    if "angle_cmd_pct" in history:
+        axs[6].plot(t, np.array(history["angle_cmd_pct"], dtype=float), "--", label="Valve cmd (FF+PID)")
+    axs[6].plot(t, arr("angle_ff_pct"), ":", label="Valve FF")
+    axs[6].plot(t, arr("angle_trim_pct"), "-.", label="Valve PID trim")
     axs[6].set_ylabel("Valve [%]")
     axs[6].grid(True)
     axs[6].legend()
@@ -2226,83 +2230,480 @@ def plot_steady_valve_sweep(sweep: Dict[str, list]) -> None:
 
 
 # ============================================================
-# MAIN
+# SIMULATION CONFIG
 # ============================================================
 
-if __name__ == "__main__":
-    cea_grid = get_or_build_cea_grid(
-        pc_min_bar=CEA_PC_MIN_BAR,
-        pc_max_bar=CEA_PC_MAX_BAR,
-        pc_step_bar=CEA_PC_STEP_BAR,
-        of_min=CEA_OF_MIN,
-        of_max=CEA_OF_MAX,
-        of_step=CEA_OF_STEP,
-    )
-
-    throat_area_m2, design_perf = throat_area_from_design_point(
-        design_thrust_n=DESIGN_THRUST_N,
-        design_pc_bar=DESIGN_PC_BAR,
-        design_of=DESIGN_OF,
-        cea_grid=cea_grid,
-    )
-
-    throat_diameter_m = math.sqrt(4.0 * throat_area_m2 / np.pi)
-    exit_area_m2 = EPSILON * throat_area_m2
-    exit_diameter_m = math.sqrt(4.0 * exit_area_m2 / np.pi)
-
-    print("\n==============================================================")
-    print("DESIGN REFERENCE")
-    print(f"Design thrust:                   {DESIGN_THRUST_N:.3f} N")
-    print(f"Design chamber pressure:         {DESIGN_PC_BAR:.3f} bar")
-    print(f"Design O/F:                      {DESIGN_OF:.3f}")
-    print(f"Design C*:                       {design_perf['cstar']:.3f} m/s")
-    print(f"Design Cf:                       {design_perf['cf']:.5f}")
-    print(f"Throat area:                     {throat_area_m2:.6e} m^2")
-    print(f"Exit area:                       {exit_area_m2:.6e} m^2")
-    print(f"Throat diameter:                 {1000.0 * throat_diameter_m:.4f} mm")
-    print(f"Exit diameter:                   {1000.0 * exit_diameter_m:.4f} mm")
-    print("==============================================================")
-
-    feed_model = FeedSideModel(
-        tank_pressure_bar=PT_BAR_DEFAULT,
-        cda_pfs_m2=CDA_PFS_M2_DEFAULT,
-        cda_mtv_max_m2=CDA_MTV_MAX_M2_DEFAULT,
-        angle_data_pct=ANGLE_DATA_PCT_DEFAULT,
-        cv_data=CV_DATA_DEFAULT,
-        fluid=FLUID,
-    )
-
-    history = run_time_marching_burn(
-        burn_time_s=BURN_TIME_S,
-        dt_s=DT_S,
-        temperature_C=TEMPERATURE_C_DEFAULT,
-        d_port_initial_m=D_PORT_INITIAL_M,
-        feed_model=feed_model,
-        throat_area_m2=throat_area_m2,
-        cea_grid=cea_grid,
-        tau_pc_s=TAU_PC_S,
-        tau_mdot_s=TAU_MDOT_S,
-        d_port_max_m=D_PORT_MAX_M,
-        use_pid=USE_PID,
-        use_feedforward=USE_FEEDFORWARD,
-    )
-
-    print_time_marching_summary(history)
-    plot_time_history(history)
-
-    # Uncomment if you want to inspect the steady map directly
+@dataclass
+class SimConfig:
     """
-    sweep = run_steady_valve_sweep(
-        angle_start_pct=FF_SWEEP_ANGLE_START_PCT,
-        angle_end_pct=FF_SWEEP_ANGLE_END_PCT,
-        angle_step_pct=2.0,
-        temperature_C=TEMPERATURE_C_DEFAULT,
-        d_port_fixed_m=D_PORT_INITIAL_M,
-        feed_model=feed_model,
-        throat_area_m2=throat_area_m2,
-        cea_grid=cea_grid,
-        mdot_min=M_DOT_MIN,
-        mdot_max=M_DOT_MAX,
-    )
-    plot_steady_valve_sweep(sweep)
+    All tuneable parameters for one MTV simulation run.
+
+    Build once and pass to MTVSimulation.  PID gains, servo parameters, and
+    feed-system characteristics can all be varied between runs while sharing
+    the expensive CEA lookup grid.
     """
+    # -- Feed system --
+    pt_bar: float = PT_BAR_DEFAULT
+    temperature_c: float = TEMPERATURE_C_DEFAULT
+    cda_pfs_m2: float = CDA_PFS_M2_DEFAULT
+    cda_mtv_max_m2: float = CDA_MTV_MAX_M2_DEFAULT
+
+    # -- Grain geometry --
+    d_port_initial_m: float = D_PORT_INITIAL_M
+    d_port_max_m: Optional[float] = D_PORT_MAX_M
+
+    # -- Time-march --
+    burn_time_s: float = BURN_TIME_S
+    dt_s: float = DT_S
+    tau_pc_s: float = TAU_PC_S
+    tau_mdot_s: float = TAU_MDOT_S
+
+    # -- Servo actuator (P-controller driving the MTV valve) --
+    servo_kp: float = 20.0                   # [(%/s) per % position error]
+    servo_max_rate_pct_per_s: float = 120.0  # Hard slew-rate ceiling [%/s]
+
+    # -- PID controller --
+    pid_kp: float = PID_KP
+    pid_ki: float = PID_KI
+    pid_kd: float = PID_KD
+    pid_trim_min_pct: float = PID_TRIM_MIN_PCT
+    pid_trim_max_pct: float = PID_TRIM_MAX_PCT
+    pid_valve_min_pct: float = PID_VALVE_MIN_PCT
+    pid_valve_max_pct: float = PID_VALVE_MAX_PCT
+    pid_initial_valve_pct: float = PID_INITIAL_VALVE_PCT
+    pid_integral_min: float = PID_INTEGRAL_MIN
+    pid_integral_max: float = PID_INTEGRAL_MAX
+    pid_rate_limit_pct_per_s: float = PID_RATE_LIMIT_PCT_PER_S
+
+    # -- Control modes --
+    use_pid: bool = USE_PID
+    use_feedforward: bool = USE_FEEDFORWARD
+
+    # -- Thrust schedule callable: (t_s: float) -> thrust_N: float --
+    thrust_schedule: Optional[Callable[[float], float]] = None
+
+    def __post_init__(self) -> None:
+        if self.thrust_schedule is None:
+            self.thrust_schedule = thrust_target_schedule_n
+
+
+# ============================================================
+# SERVO ACTUATOR MODEL
+# ============================================================
+
+@dataclass
+class ServoActuator:
+    """
+    P-controller model of the servo driving the MTV valve.
+
+    The physical valve position tracks the commanded angle with proportional
+    rate control and a hard slew-rate ceiling, capturing the mechanical lag
+    of the servo mechanism.  actual_angle_pct is the state used by the feed
+    model; angle_cmd_pct is what the flight controller requests.
+    """
+    kp: float                    # Proportional rate gain [(%/s) per % error]
+    max_rate_pct_per_s: float    # Hard slew-rate ceiling [%/s]
+    angle_min_pct: float         # Lower travel stop [%]
+    angle_max_pct: float         # Upper travel stop [%]
+    actual_angle_pct: float = 0.0
+
+    def step(self, cmd_angle_pct: float, dt: float) -> float:
+        """Advance servo state one timestep toward cmd; returns new actual angle."""
+        error_pct = cmd_angle_pct - self.actual_angle_pct
+        rate = float(np.clip(
+            self.kp * error_pct,
+            -self.max_rate_pct_per_s,
+            self.max_rate_pct_per_s,
+        ))
+        self.actual_angle_pct = float(np.clip(
+            self.actual_angle_pct + rate * dt,
+            self.angle_min_pct,
+            self.angle_max_pct,
+        ))
+        return self.actual_angle_pct
+
+
+# ============================================================
+# MTV SIMULATION CLASS
+# ============================================================
+
+class MTVSimulation:
+    """
+    Self-contained MTV hybrid-rocket closed-loop simulation.
+
+    Pass a pre-built CEA grid (expensive to compute; shared across runs) and a
+    SimConfig.  Call run() to execute the time-march and retrieve the history
+    dict, then plot() to visualise results.
+
+    Example — PID gain sweep
+    ------------------------
+    cea_grid       = get_or_build_cea_grid(...)
+    throat_area_m2, _ = throat_area_from_design_point(...)
+
+    for kp in [0.5, 1.0, 1.5, 2.0]:
+        cfg     = SimConfig(pid_kp=kp, pid_ki=0.3)
+        sim     = MTVSimulation(cfg, cea_grid, throat_area_m2)
+        history = sim.run()
+        sim.plot(history)
+    """
+
+    def __init__(
+        self,
+        config: SimConfig,
+        cea_grid: dict,
+        throat_area_m2: float,
+    ) -> None:
+        self.config = config
+        self.cea_grid = cea_grid
+        self.throat_area_m2 = throat_area_m2
+        self.feed_model = FeedSideModel(
+            tank_pressure_bar=config.pt_bar,
+            cda_pfs_m2=config.cda_pfs_m2,
+            cda_mtv_max_m2=config.cda_mtv_max_m2,
+            angle_data_pct=ANGLE_DATA_PCT_DEFAULT,
+            cv_data=CV_DATA_DEFAULT,
+            fluid=FLUID,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run(self) -> Dict[str, list]:
+        """Execute the time-marching simulation; return the full history dict."""
+        return self._run_time_march()
+
+    def plot(self, history: Dict[str, list]) -> None:
+        """Convenience wrapper around plot_time_history."""
+        plot_time_history(history)
+
+    # ------------------------------------------------------------------
+    # Internal time-march
+    # ------------------------------------------------------------------
+
+    def _run_time_march(self) -> Dict[str, list]:  # noqa: C901
+        cfg = self.config
+        n_steps = int(np.floor(cfg.burn_time_s / cfg.dt_s)) + 1
+        d_port_m = cfg.d_port_initial_m
+
+        pid = PIDController(
+            kp=cfg.pid_kp,
+            ki=cfg.pid_ki,
+            kd=cfg.pid_kd,
+            setpoint=DESIGN_PC_BAR,
+            output_min=cfg.pid_trim_min_pct,
+            output_max=cfg.pid_trim_max_pct,
+            integral_min=cfg.pid_integral_min,
+            integral_max=cfg.pid_integral_max,
+            rate_limit_pct_per_s=cfg.pid_rate_limit_pct_per_s,
+        )
+
+        servo = ServoActuator(
+            kp=cfg.servo_kp,
+            max_rate_pct_per_s=cfg.servo_max_rate_pct_per_s,
+            angle_min_pct=cfg.pid_valve_min_pct,
+            angle_max_pct=cfg.pid_valve_max_pct,
+            actual_angle_pct=float(
+                np.clip(cfg.pid_initial_valve_pct, cfg.pid_valve_min_pct, cfg.pid_valve_max_pct)
+            ),
+        )
+
+        init_result = solve_coupled_operating_point(
+            angle_pct=servo.actual_angle_pct,
+            temperature_C=cfg.temperature_c,
+            d_port_m=d_port_m,
+            feed_model=self.feed_model,
+            throat_area_m2=self.throat_area_m2,
+            cea_grid=self.cea_grid,
+            mdot_min=M_DOT_MIN,
+            mdot_max=M_DOT_MAX,
+            tol=M_DOT_RES_TOL,
+            max_iter=MAX_OUTER_ITER,
+        )
+
+        if not init_result["converged"]:
+            raise RuntimeError(
+                "Could not initialise simulation from a valid steady operating point. "
+                f"Feed error: {init_result['feed'].get('error', 'none')} | "
+                f"Engine error: {init_result['engine'].get('error', 'none')}"
+            )
+
+        init_feed = init_result["feed"]
+        init_eng = init_result["engine"]
+        pc_bar = init_eng["pc_bar"]
+        m_dot_o_actual = init_eng["m_dot_o"]
+        cf_est = init_eng["cf"]
+
+        pid.reset(initial_output=0.0)
+
+        ff_map = build_pc_to_angle_feedforward_map(
+            temperature_C=cfg.temperature_c,
+            d_port_m=d_port_m,
+            feed_model=self.feed_model,
+            throat_area_m2=self.throat_area_m2,
+            cea_grid=self.cea_grid,
+        )
+        ff_last_build_t_s = 0.0
+
+        # ---- t = 0 controller step ----
+        thrust_target0_n = cfg.thrust_schedule(0.0)
+        pc_target0_bar = float(np.clip(
+            thrust_to_pc_target_bar(thrust_target0_n, cf_est, self.throat_area_m2),
+            CEA_PC_MIN_BAR, CEA_PC_MAX_BAR,
+        ))
+        angle_ff0_pct = feedforward_angle_from_pc_target(pc_target0_bar, ff_map)
+
+        if cfg.use_pid:
+            pid_state0 = pid.update(measurement=pc_bar, dt=cfg.dt_s, setpoint=pc_target0_bar)
+            angle_trim0_pct = pid_state0["output"]
+            pid_error0 = pid_state0["error"]
+            pid_integral0 = pid_state0["integral"]
+            pid_derivative0 = pid_state0["derivative"]
+        else:
+            angle_trim0_pct = 0.0
+            pid_error0 = pid_integral0 = pid_derivative0 = np.nan
+
+        angle_cmd0_pct = float(np.clip(
+            angle_ff0_pct + angle_trim0_pct, cfg.pid_valve_min_pct, cfg.pid_valve_max_pct
+        ))
+        actual_angle0_pct = servo.step(angle_cmd0_pct, cfg.dt_s)
+
+        history: Dict[str, list] = {
+            "time_s": [],
+            "thrust_target_n": [],
+            "pc_target_bar": [],
+            "angle_ff_pct": [],
+            "angle_trim_pct": [],
+            "angle_cmd_pct": [],    # total command from FF + PID, before servo
+            "angle_pct": [],        # actual valve position after servo dynamics
+            "d_port_m": [],
+            "p_tank_bar": [], "p1_bar": [], "p2_bar": [],
+            "pc_bar": [], "pc_steady_bar": [],
+            "dP_pfs_bar": [], "dP_mtv_bar": [], "dP_inj_bar": [],
+            "m_dot_o": [], "m_dot_f": [], "m_dot_total": [],
+            "of_ratio": [], "gox": [], "r_dot_m_s": [], "r_dot_mm_s": [],
+            "cstar": [], "cf": [], "isp_s": [], "ivac_s": [], "tc_K": [],
+            "thrust_N": [],
+            "pid_error_bar": [], "pid_integral": [], "pid_derivative": [],
+            "solver_converged": [], "solver_message": [],
+        }
+
+        # -- seed step 0 --
+        history["time_s"].append(0.0)
+        history["thrust_target_n"].append(thrust_target0_n)
+        history["pc_target_bar"].append(pc_target0_bar)
+        history["angle_ff_pct"].append(angle_ff0_pct)
+        history["angle_trim_pct"].append(angle_trim0_pct)
+        history["angle_cmd_pct"].append(angle_cmd0_pct)
+        history["angle_pct"].append(actual_angle0_pct)
+        history["d_port_m"].append(d_port_m)
+        history["p_tank_bar"].append(init_feed["p_tank_bar"])
+        history["p1_bar"].append(init_feed["p1_bar"])
+        history["p2_bar"].append(init_feed["p2_bar"])
+        history["pc_bar"].append(pc_bar)
+        history["pc_steady_bar"].append(pc_bar)
+        history["dP_pfs_bar"].append(init_feed["dP_pfs_bar"])
+        history["dP_mtv_bar"].append(init_feed["dP_mtv_bar"])
+        history["dP_inj_bar"].append(init_feed["p2_bar"] - pc_bar)
+        history["m_dot_o"].append(init_eng["m_dot_o"])
+        history["m_dot_f"].append(init_eng["m_dot_f"])
+        history["m_dot_total"].append(init_eng["m_dot_total"])
+        history["of_ratio"].append(init_eng["of_ratio"])
+        history["gox"].append(init_eng["gox"])
+        history["r_dot_m_s"].append(init_eng["r_dot"])
+        history["r_dot_mm_s"].append(init_eng["r_dot_mm"])
+        history["cstar"].append(init_eng["cstar"])
+        history["cf"].append(init_eng["cf"])
+        history["isp_s"].append(init_eng["isp"])
+        history["ivac_s"].append(init_eng["ivac"])
+        history["tc_K"].append(init_eng["tc"])
+        history["thrust_N"].append(init_eng["thrust"])
+        history["pid_error_bar"].append(pid_error0)
+        history["pid_integral"].append(pid_integral0)
+        history["pid_derivative"].append(pid_derivative0)
+        history["solver_converged"].append(True)
+        history["solver_message"].append("Initialized from steady-state solution")
+
+        start_wall = time.time()
+        last_progress_print = start_wall
+
+        for k in range(1, n_steps):
+            t_s = k * cfg.dt_s
+
+            if SHOW_PROGRESS:
+                now = time.time()
+                should_print = (
+                    (k % PROGRESS_PRINT_EVERY_N_STEPS == 0)
+                    and (
+                        (now - last_progress_print) >= PROGRESS_PRINT_MIN_INTERVAL_S
+                        or k == n_steps - 1
+                    )
+                )
+                if should_print:
+                    elapsed = now - start_wall
+                    progress = k / n_steps
+                    est_total = elapsed / max(progress, 1e-9)
+                    print(
+                        f"[{k:6d}/{n_steps:6d}] "
+                        f"{100.0 * progress:6.2f}% | "
+                        f"Sim t = {t_s:7.3f} s | "
+                        f"Elapsed = {elapsed:7.1f} s | "
+                        f"ETA = {max(est_total - elapsed, 0.0):7.1f} s"
+                    )
+                    last_progress_print = now
+
+            try:
+                if cfg.use_feedforward and (t_s - ff_last_build_t_s) >= FF_REBUILD_INTERVAL_S:
+                    ff_map = build_pc_to_angle_feedforward_map(
+                        temperature_C=cfg.temperature_c,
+                        d_port_m=d_port_m,
+                        feed_model=self.feed_model,
+                        throat_area_m2=self.throat_area_m2,
+                        cea_grid=self.cea_grid,
+                    )
+                    ff_last_build_t_s = t_s
+
+                thrust_target_n = cfg.thrust_schedule(t_s)
+
+                if not np.isfinite(cf_est) or cf_est <= 0.0:
+                    cf_est = max(init_eng["cf"], 1e-6)
+
+                pc_target_bar = float(np.clip(
+                    thrust_to_pc_target_bar(thrust_target_n, cf_est, self.throat_area_m2),
+                    CEA_PC_MIN_BAR, CEA_PC_MAX_BAR,
+                ))
+
+                if cfg.use_feedforward:
+                    angle_ff_pct = feedforward_angle_from_pc_target(pc_target_bar, ff_map)
+                else:
+                    angle_ff_pct = cfg.pid_initial_valve_pct
+
+                if cfg.use_pid:
+                    pid_state = pid.update(measurement=pc_bar, dt=cfg.dt_s, setpoint=pc_target_bar)
+                    angle_trim_pct = pid_state["output"]
+                    pid_error = pid_state["error"]
+                    pid_integral = pid_state["integral"]
+                    pid_derivative = pid_state["derivative"]
+                else:
+                    angle_trim_pct = 0.0
+                    pid_error = pid_integral = pid_derivative = np.nan
+
+                angle_cmd_pct = float(np.clip(
+                    angle_ff_pct + angle_trim_pct, cfg.pid_valve_min_pct, cfg.pid_valve_max_pct
+                ))
+                # Servo P-controller: physical valve position lags the command
+                actual_angle_pct = servo.step(angle_cmd_pct, cfg.dt_s)
+
+                feed = self.feed_model.evaluate_from_mdot(
+                    angle_pct=actual_angle_pct,
+                    mdot_kg_s=m_dot_o_actual,
+                    temperature_C=cfg.temperature_c,
+                )
+
+                props = NitrousProperties(fluid=FLUID)
+                rho2 = props.density_from_PT(feed["p2_bar"], cfg.temperature_c)
+                dP_inj_pa_old = bar_to_pa(max(feed["p2_bar"] - pc_bar, 0.0))
+                m_dot_o_target = (
+                    CDA_INJ_M2 * safe_sqrt(2.0 * rho2 * dP_inj_pa_old)
+                    if dP_inj_pa_old > 0.0 else 0.0
+                )
+
+                alpha_m = min(max(cfg.dt_s / cfg.tau_mdot_s if cfg.tau_mdot_s > 0.0 else 1.0, 0.0), 1.0)
+                m_dot_o_actual += alpha_m * (m_dot_o_target - m_dot_o_actual)
+
+                eng = compute_chamber_state_from_mdot(
+                    m_dot_o=m_dot_o_actual,
+                    pc_bar=pc_bar,
+                    d_port_m=d_port_m,
+                    throat_area_m2=self.throat_area_m2,
+                    cea_grid=self.cea_grid,
+                )
+
+                if not np.isfinite(eng["pc_steady_bar"]):
+                    raise ValueError("pc_steady_bar became non-finite.")
+
+                alpha_pc = min(max(cfg.dt_s / cfg.tau_pc_s if cfg.tau_pc_s > 0.0 else 1.0, 0.0), 1.0)
+                pc_bar += alpha_pc * (eng["pc_steady_bar"] - pc_bar)
+
+                eng = compute_chamber_state_from_mdot(
+                    m_dot_o=m_dot_o_actual,
+                    pc_bar=pc_bar,
+                    d_port_m=d_port_m,
+                    throat_area_m2=self.throat_area_m2,
+                    cea_grid=self.cea_grid,
+                )
+                eng["dP_inj_bar"] = feed["p2_bar"] - pc_bar
+                cf_est = eng["cf"]
+
+                history["time_s"].append(t_s)
+                history["thrust_target_n"].append(thrust_target_n)
+                history["pc_target_bar"].append(pc_target_bar)
+                history["angle_ff_pct"].append(angle_ff_pct)
+                history["angle_trim_pct"].append(angle_trim_pct)
+                history["angle_cmd_pct"].append(angle_cmd_pct)
+                history["angle_pct"].append(actual_angle_pct)
+                history["d_port_m"].append(d_port_m)
+                history["p_tank_bar"].append(feed["p_tank_bar"])
+                history["p1_bar"].append(feed["p1_bar"])
+                history["p2_bar"].append(feed["p2_bar"])
+                history["pc_bar"].append(pc_bar)
+                history["pc_steady_bar"].append(eng["pc_steady_bar"])
+                history["dP_pfs_bar"].append(feed["dP_pfs_bar"])
+                history["dP_mtv_bar"].append(feed["dP_mtv_bar"])
+                history["dP_inj_bar"].append(eng["dP_inj_bar"])
+                history["m_dot_o"].append(eng["m_dot_o"])
+                history["m_dot_f"].append(eng["m_dot_f"])
+                history["m_dot_total"].append(eng["m_dot_total"])
+                history["of_ratio"].append(eng["of_ratio"])
+                history["gox"].append(eng["gox"])
+                history["r_dot_m_s"].append(eng["r_dot"])
+                history["r_dot_mm_s"].append(eng["r_dot_mm"])
+                history["cstar"].append(eng["cstar"])
+                history["cf"].append(eng["cf"])
+                history["isp_s"].append(eng["isp"])
+                history["ivac_s"].append(eng["ivac"])
+                history["tc_K"].append(eng["tc"])
+                history["thrust_N"].append(eng["thrust"])
+                history["pid_error_bar"].append(pid_error)
+                history["pid_integral"].append(pid_integral)
+                history["pid_derivative"].append(pid_derivative)
+                history["solver_converged"].append(True)
+                history["solver_message"].append("OK")
+
+                d_port_m += 2.0 * eng["r_dot"] * cfg.dt_s
+
+                if cfg.d_port_max_m is not None and d_port_m >= cfg.d_port_max_m:
+                    print(f"\nTime marching stopped at t = {t_s:.3f} s")
+                    print(f"Reason: port diameter reached limit {cfg.d_port_max_m:.6f} m")
+                    break
+
+            except Exception as e:
+                history["time_s"].append(t_s)
+                history["thrust_target_n"].append(np.nan)
+                history["pc_target_bar"].append(np.nan)
+                history["angle_ff_pct"].append(np.nan)
+                history["angle_trim_pct"].append(np.nan)
+                history["angle_cmd_pct"].append(np.nan)
+                history["angle_pct"].append(servo.actual_angle_pct)
+                history["d_port_m"].append(d_port_m)
+                for key in [
+                    "p_tank_bar", "p1_bar", "p2_bar", "pc_bar", "pc_steady_bar",
+                    "dP_pfs_bar", "dP_mtv_bar", "dP_inj_bar",
+                    "m_dot_o", "m_dot_f", "m_dot_total", "of_ratio", "gox",
+                    "r_dot_m_s", "r_dot_mm_s", "cstar", "cf", "isp_s",
+                    "ivac_s", "tc_K", "thrust_N",
+                    "pid_error_bar", "pid_integral", "pid_derivative",
+                ]:
+                    history[key].append(np.nan)
+                history["solver_converged"].append(False)
+                history["solver_message"].append(str(e))
+                print(f"\nTime marching stopped at t = {t_s:.3f} s")
+                print(f"Reason: {e}")
+                if STOP_ON_SOLVER_FAILURE:
+                    break
+
+        return history
+
+
+# This module is intended to be imported, not run directly.
+# Use pid_tuning_runner.py to execute single runs, parameter sweeps, and plots.
