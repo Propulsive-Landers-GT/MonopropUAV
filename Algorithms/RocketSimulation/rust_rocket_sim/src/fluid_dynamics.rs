@@ -428,11 +428,11 @@ impl ThermoFluidSolver {
     pub fn fluid_dynamics_update(
         &mut self,
         thrust_commanded: f64,
-        is_rcs_on: bool,
         o_iso_open: bool,
         r_mv_open: bool,
         o_vnt_open: bool,
         n2o_mass: f64,
+        n2_mass_runtank: f64,
         n2_mass_total: f64,
         dt: f64,
     ) -> FluidDynamicsOutput {
@@ -518,13 +518,12 @@ impl ThermoFluidSolver {
             new_n2_mass_runtank = (self.parameters.runtank_vol - new_n2o_mass / rho_n2o) * rho_n2;
             new_n2_mass_storagetanks = (n2_mass_total - new_n2_mass_runtank - delta_m_n2).max(0.0);
         } else {
-            // r_mv closed — no nitrogen transfer, run tank pressure drops as N2O is consumed
-            new_n2_mass_runtank = (self.parameters.runtank_vol - new_n2o_mass / rho_n2o) * rho_n2;
-            new_n2_mass_storagetanks = (n2_mass_total - new_n2_mass_runtank).max(0.0);
-        }
-        
-        if is_rcs_on {
-            new_n2_mass_storagetanks -= self.parameters.n2_mass_flowrate_rcs * dt;
+            // r_mv closed — masses are conserved; pressure drops naturally as ullage expands.
+            // The ideal gas law at the PT tap point (below) captures the pressure change.
+            // RCS N2 consumption is already applied upstream via rcs.update(), so
+            // n2_mass_total already reflects it — no separate subtraction needed here.
+            new_n2_mass_runtank = n2_mass_runtank;
+            new_n2_mass_storagetanks = (n2_mass_total - n2_mass_runtank).max(0.0);
         }
 
         // 5. Vent valve — relieves run tank pressure by venting nitrogen
