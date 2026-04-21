@@ -550,11 +550,17 @@ impl ThermoFluidSolver {
         // check-valve pressure-drop extension.
         let p_downstream_mtv_bar = fr_sol.pc_bar;
 
-        // o-pt: run tank pressure.  The ullage volume is the run tank
-        // volume minus the liquid N2O volume.  The nitrogen in that
-        // ullage obeys the ideal gas law: P = m·R·T / V.
+        // o-pt: run tank pressure.  Total pressure = N2 partial pressure + N2O vapor pressure.
+        //   P_N2  = m_N2 * R_N2 * T / V_ullage  (ideal gas law on the nitrogen)
+        //   P_N2O = saturation pressure at tank temperature (from NIST table)
+        // While liquid N2O is present the tank is two-phase and N2O vapor pressure
+        // dominates (~52 bar at 28 °C), so omitting it would severely underestimate
+        // the true tank pressure.
         let v_ullage = (self.parameters.runtank_vol - new_n2o_mass / rho_n2o).max(1e-9);
-        let p_runtank_pa = n2_mass_runtank_after_vent * r_specific_n2 * self.parameters.temp / v_ullage;
+        let p_n2_pa = n2_mass_runtank_after_vent * r_specific_n2 * self.parameters.temp / v_ullage;
+        let p_sat_pa: Vec<f64> = self.parameters.nist_data.p_sat_mpa.iter().map(|&p| p * 1e6).collect();
+        let p_n2o_vapor_pa = Self::interp1(&self.parameters.nist_data.t_sat, &p_sat_pa, self.parameters.temp);
+        let p_runtank_pa = p_n2_pa + p_n2o_vapor_pa;
         let p_runtank_bar = p_runtank_pa / 1e5;
 
         // oa-pt: pressure upstream of the run tank, downstream of r_mv.
