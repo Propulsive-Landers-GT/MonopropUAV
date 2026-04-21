@@ -719,24 +719,27 @@ impl RCS {
     //   rcs1_mv open → clockwise roll  (negative Z torque)
     //   rcs2_mv open → counter-clockwise roll (positive Z torque)
     //
-    // TODO: Clarify if both rcs1_mv and rcs2_mv can be open simultaneously.
-    //       If so, the torques cancel out and only nitrogen is consumed.
+    // Both valves can be open simultaneously (each is independently controlled).
+    // When both are open the torques cancel but N2 is consumed by both pairs.
     pub fn update(&mut self, rcs1_open: bool, rcs2_open: bool, nitrogen_mass: f64, dt: f64, system_time: f64) -> RCSEffect {
         let mut remaining_nitrogen_mass = nitrogen_mass;
 
         let elapsed_time = system_time - self.system_time;
         // Determine the effective valve states — hold previous state between update ticks
+        // Encoding: 2.0 = both open, 1.0 = rcs1 only, -1.0 = rcs2 only, 0.0 = neither
         let (active_rcs1, active_rcs2) = if elapsed_time < 1.0 / self.update_rate {
             // Between update ticks: hold previous command
-            let prev_rcs1 = self.last_command > 0.0;
-            let prev_rcs2 = self.last_command < 0.0;
+            let prev_rcs1 = self.last_command == 1.0 || self.last_command == 2.0;
+            let prev_rcs2 = self.last_command == -1.0 || self.last_command == 2.0;
             (prev_rcs1, prev_rcs2)
         } else {
             self.system_time = system_time;
             // Encode the current valve state into last_command for hold logic
-            if rcs1_open && !rcs2_open {
+            if rcs1_open && rcs2_open {
+                self.last_command = 2.0;
+            } else if rcs1_open {
                 self.last_command = 1.0;
-            } else if rcs2_open && !rcs1_open {
+            } else if rcs2_open {
                 self.last_command = -1.0;
             } else {
                 self.last_command = 0.0;
