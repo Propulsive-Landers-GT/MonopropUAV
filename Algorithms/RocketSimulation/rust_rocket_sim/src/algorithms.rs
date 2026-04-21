@@ -258,11 +258,18 @@ pub struct Lossless {
     pub lower_thrust_bound: f64,
     pub upper_thrust_bound: f64,
     pub tvc_range_rad: f64,
+    pub coarse_line_search_delta_t: f64,
+    pub fine_line_search_delta_t: f64,
     pub coarse_delta_t: f64,
     pub fine_delta_t: f64,
     pub glide_slope: f64,
-    pub use_glide_slope: bool,
-    pub flip_glide_slope: bool,
+    pub use_bottom_glide_slope: bool,
+    pub use_top_glide_slope: bool,
+    pub use_terminal_lateral_hard_tube: bool,
+    pub terminal_lateral_hard_tube_time_s: f64,
+    pub terminal_lateral_hard_tube_radius_m: f64,
+    pub pointing_direction: [f64; 3],
+    pub timeout: f64,
     pub system_time: f64,
     // pub update_rate: f64,
     pub lossless_refresh_updater: LosslessRefreshUpdater,
@@ -273,7 +280,28 @@ pub struct Lossless {
 }
 
 impl Lossless {
-    pub fn new(max_velocity: f64, dry_mass: f64, alpha: f64, lower_thrust_bound: f64, upper_thrust_bound: f64, tvc_range_rad: f64, coarse_delta_t: f64, fine_delta_t: f64, glide_slope: f64, use_glide_slope: bool, flip_glide_slope: bool, pointing_direction: [f64; 3], system_time: f64, lossless_refresh_updater: LosslessRefreshUpdater) -> Self {
+    pub fn new(
+        max_velocity: f64,
+        dry_mass: f64,
+        alpha: f64,
+        lower_thrust_bound: f64,
+        upper_thrust_bound: f64,
+        tvc_range_rad: f64,
+        coarse_line_search_delta_t: f64,
+        fine_line_search_delta_t: f64,
+        coarse_delta_t: f64,
+        fine_delta_t: f64,
+        glide_slope: f64,
+        use_bottom_glide_slope: bool,
+        use_top_glide_slope: bool,
+        use_terminal_lateral_hard_tube: bool,
+        terminal_lateral_hard_tube_time_s: f64,
+        terminal_lateral_hard_tube_radius_m: f64,
+        pointing_direction: [f64; 3],
+        timeout: f64,
+        system_time: f64,
+        lossless_refresh_updater: LosslessRefreshUpdater,
+    ) -> Self {
         Self {
             max_velocity,
             dry_mass,
@@ -281,11 +309,18 @@ impl Lossless {
             lower_thrust_bound,
             upper_thrust_bound,
             tvc_range_rad,
+            coarse_line_search_delta_t,
+            fine_line_search_delta_t,
             coarse_delta_t,
             fine_delta_t,
             glide_slope,
-            use_glide_slope,
-            flip_glide_slope,
+            use_bottom_glide_slope,
+            use_top_glide_slope,
+            use_terminal_lateral_hard_tube,
+            terminal_lateral_hard_tube_time_s,
+            terminal_lateral_hard_tube_radius_m,
+            pointing_direction,
+            timeout,
             system_time,
             // update_rate,
             lossless_refresh_updater,
@@ -317,16 +352,44 @@ impl Lossless {
         let lower_thrust_bound = 400.0;
         let upper_thrust_bound = 900.0;
         let tvc_range_rad = 15_f64.to_radians();
+        let coarse_line_search_delta_t = 0.1;
+        let fine_line_search_delta_t = 0.01;
         let coarse_delta_t = 0.25;
         let fine_delta_t = 0.1;
         let glide_slope = 0.05_f64.to_radians();
-        let use_glide_slope = true;
-        let flip_glide_slope = true;
+        let use_bottom_glide_slope = true;
+        let use_top_glide_slope = true;
+        let use_terminal_lateral_hard_tube = false;
+        let terminal_lateral_hard_tube_time_s = 0.0;
+        let terminal_lateral_hard_tube_radius_m = 0.0;
+        let pointing_direction = [0.0, 0.0, 1.0];
+        let timeout = 3.0;
         let system_time = -1.0;
         // let update_rate = 3.0;
         let lossless_refresh_updater = LosslessRefreshUpdater::default();
 
-        Self::new(max_velocity, dry_mass, alpha, lower_thrust_bound, upper_thrust_bound, tvc_range_rad, coarse_delta_t, fine_delta_t, glide_slope, use_glide_slope, flip_glide_slope, [0.0; 3], system_time, lossless_refresh_updater)
+        Self::new(
+            max_velocity,
+            dry_mass,
+            alpha,
+            lower_thrust_bound,
+            upper_thrust_bound,
+            tvc_range_rad,
+            coarse_line_search_delta_t,
+            fine_line_search_delta_t,
+            coarse_delta_t,
+            fine_delta_t,
+            glide_slope,
+            use_bottom_glide_slope,
+            use_top_glide_slope,
+            use_terminal_lateral_hard_tube,
+            terminal_lateral_hard_tube_time_s,
+            terminal_lateral_hard_tube_radius_m,
+            pointing_direction,
+            timeout,
+            system_time,
+            lossless_refresh_updater,
+        )
     }
 
     pub fn update(&mut self, current_position: [f64; 3], current_velocity: [f64; 3], target_position: [f64; 3], propellant_mass: f64, system_time: f64) -> TrajectoryResult {
@@ -372,10 +435,18 @@ impl Lossless {
             lower_thrust_bound: self.lower_thrust_bound,
             upper_thrust_bound: self.upper_thrust_bound,
             tvc_range_rad: self.tvc_range_rad,
+            coarse_line_search_delta_t: self.coarse_line_search_delta_t,
+            fine_line_search_delta_t: self.fine_line_search_delta_t,
             coarse_delta_t: self.coarse_delta_t,
             fine_delta_t: self.fine_delta_t,
-            use_glide_slope: self.use_glide_slope,
             glide_slope: self.glide_slope,
+            use_bottom_glide_slope: self.use_bottom_glide_slope,
+            use_top_glide_slope: self.use_top_glide_slope,
+            use_terminal_lateral_hard_tube: self.use_terminal_lateral_hard_tube,
+            terminal_lateral_hard_tube_time_s: self.terminal_lateral_hard_tube_time_s,
+            terminal_lateral_hard_tube_radius_m: self.terminal_lateral_hard_tube_radius_m,
+            pointing_direction: self.pointing_direction,
+            timeout: self.timeout,
             N: 20, // will be overridden by the solver based on the problem setup
             ..Default::default()
         };

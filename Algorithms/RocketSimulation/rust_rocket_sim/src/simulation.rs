@@ -335,8 +335,10 @@ impl Simulation {
                 1000.0, 1000.0, 1000.0 
             ]));
             self.lossless.lower_thrust_bound = 400.0;
-            self.lossless.flip_glide_slope = false;
-            self.lossless.use_glide_slope = true;
+            // self.lossless.flip_glide_slope = false;
+            // self.lossless.use_glide_slope = true;
+            self.lossless.use_bottom_glide_slope = true;
+            self.lossless.use_top_glide_slope = true;
             self.lossless.glide_slope = 0.005_f64.to_radians();
             // self.lossless.max_velocity = 5.0;
             // if self.rocket.velocity.norm() >= 5.0 {
