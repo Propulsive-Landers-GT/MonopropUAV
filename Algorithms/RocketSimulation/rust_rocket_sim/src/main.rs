@@ -1,11 +1,11 @@
-mod rocket_dynamics;
-mod device_sim;
-mod algorithms;
-mod sloshing_sim;
-mod fluid_dynamics;
-mod wind_sim;
-mod aero_tables;
-mod simulation;
+pub mod rocket_dynamics;
+pub mod device_sim;
+pub mod algorithms;
+pub mod sloshing_sim;
+pub mod fluid_dynamics;
+pub mod wind_sim;
+pub mod aero_tables;
+pub mod simulation;
 use crate::rocket_dynamics::*;
 use crate::device_sim::*;
 use crate::algorithms::*;
@@ -72,8 +72,8 @@ pub fn export_imu_to_csv(
 fn main() {
     let mut sim = Simulation::default();
     sim.debug = true;
-    sim.rocket.position = Vector3::new(0.0, 0.0, 49.0);
-    sim.start_state = "hover".to_string();
+    // sim.rocket.position = Vector3::new(0.0, 0.0, 49.0);
+    sim.start_state = "ascent".to_string();
     sim.min_time = 3.0;
 
     sim.init();

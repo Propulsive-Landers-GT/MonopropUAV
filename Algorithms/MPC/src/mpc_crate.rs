@@ -9,6 +9,18 @@ use ndarray::ArrayView1;
 use optimization_engine::{panoc::*, *};
 use std::time::Instant;
 
+pub struct MPCDebugInfo {
+    pub iterations: usize,
+}
+
+impl MPCDebugInfo {
+    pub fn new() -> Self {
+        Self {
+            iterations: 0,
+        }
+    }
+}
+
 // pub fn dynamics(x: &Array1<f64>, u: &Array1<f64>, mass: f64, moi: &Array2<f64>, dt: f64) -> Array1<f64> {
 //     // let mut x_next = Array1::<f64>::zeros(x.len());
 //     // Constants
@@ -194,7 +206,7 @@ pub fn dynamics(x: &Array1<f64>, u: &Array1<f64>, mass: f64, moi: &Array2<f64>, 
     let z_ddot = acc[2];
 
     // TVC torque
-    let d = 0.663834203726;
+    let d = 0.663834203726; // TODO: make ts customizable
     let r_cp = Array1::from(vec![0.0, 0.0, -d]);
     let torque_b = Array1::from(vec![
         r_cp[1] * thrust_b[2] - r_cp[2] * thrust_b[1],
@@ -611,8 +623,9 @@ pub fn OpEnSolve(
     max_thrust: f64,
     gimbal_limit_rad: f64,
     dt: f64,
-) -> (Array1<f64>, Array2<f64>) {
+) -> (Array1<f64>, Array2<f64>, MPCDebugInfo) {
     use ndarray::ArrayView1;
+    let mut debug_info = MPCDebugInfo::new();
 
     let N = U.len();
     let m = U[0].len();
@@ -671,7 +684,8 @@ pub fn OpEnSolve(
 
     // Initialize at zero — meaning "start from the warm-start U, apply no delta"
     let mut du_flat: Vec<f64> = vec![0.0; n_dim_u];
-    let _status = panoc.solve(&mut du_flat).unwrap();
+    let status = panoc.solve(&mut du_flat).unwrap();
+    debug_info.iterations = status.iterations();
 
     // Recover absolute U: U_new = U_warm + dU, clamped to hard bounds
     let du_seq = Array1::from(du_flat);
@@ -691,7 +705,7 @@ pub fn OpEnSolve(
     let u_apply = u_seq_arr.slice(s![0..m]).to_owned();
     let U_seq = Array2::from_shape_vec((N, m), u_seq_arr.to_vec()).unwrap();
 
-    (u_apply, U_seq)
+    (u_apply, U_seq, debug_info)
 }
 
 // Main MPC function to be called externally

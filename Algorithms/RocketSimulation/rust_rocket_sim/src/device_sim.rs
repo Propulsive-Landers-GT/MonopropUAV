@@ -2,6 +2,53 @@ use nalgebra::{Vector3, UnitQuaternion};
 use rand::prelude::*;
 use rand_distr::{Normal, Distribution};
 
+#[derive(Debug, Clone)]
+pub struct RefreshUpdater {
+    pub overhead: f64, // overhead on startup of process, in seconds
+    pub overhead_sigma: f64, // standard deviation of overhead, in seconds
+    pub iteration_time: f64, // time each iteration takes, in seconds
+    pub iteration_sigma: f64, // standard deviation of iteration time, in seconds
+    pub iterations: f64,
+    pub start_time: f64,
+    current_overhead: f64,
+    current_total_iteration_time: f64,
+}
+
+impl RefreshUpdater {
+    pub fn new(overhead: f64, overhead_sigma: f64, iteration_time: f64, iteration_sigma: f64) -> Self {
+        let mut refresh_updater = Self {
+            overhead,
+            overhead_sigma,
+            iteration_time,
+            iteration_sigma,
+            iterations: 1.0,
+            start_time: 0.0,
+            current_overhead: overhead,
+            current_total_iteration_time: iteration_time,
+        };
+
+        refresh_updater.reset(1.0, 0.0);
+
+        refresh_updater
+    }
+
+    pub fn reset(&mut self, iterations: f64, system_time: f64) {
+        self.iterations = iterations;
+        self.start_time = system_time;
+
+        let mut rng = rand::rng();
+        self.current_overhead = self.overhead + noise_1_d(self.overhead_sigma, &mut rng);
+        self.current_total_iteration_time = self.iteration_time * self.iterations + noise_1_d(self.iteration_sigma * (self.iterations as f64).sqrt(), &mut rng);
+    }
+
+    pub fn update(&mut self, system_time: f64) -> bool {
+        if system_time - self.start_time > self.current_overhead + self.current_total_iteration_time {
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
 
 /// A simple on/off valve used throughout the propellant feed system.
 /// These model actuated valves (solenoid or pneumatic) that are either
@@ -811,7 +858,7 @@ impl PressureTransducer {
 
 
 // Helper to generate 3D noise
-fn noise_3_d(sigma: &Vector3<f64>, rng: &mut ThreadRng) -> Vector3<f64> {
+pub fn noise_3_d(sigma: &Vector3<f64>, rng: &mut ThreadRng) -> Vector3<f64> {
     let n_x = Normal::new(0.0, sigma.x).unwrap().sample(rng);
     let n_y = Normal::new(0.0, sigma.y).unwrap().sample(rng);
     let n_z = Normal::new(0.0, sigma.z).unwrap().sample(rng);
@@ -819,6 +866,6 @@ fn noise_3_d(sigma: &Vector3<f64>, rng: &mut ThreadRng) -> Vector3<f64> {
 }
 
 // Helper to generate 3D noise
-fn noise_1_d(sigma: f64, rng: &mut ThreadRng) -> f64 {
+pub fn noise_1_d(sigma: f64, rng: &mut ThreadRng) -> f64 {
     Normal::new(0.0, sigma).unwrap().sample(rng)
 }

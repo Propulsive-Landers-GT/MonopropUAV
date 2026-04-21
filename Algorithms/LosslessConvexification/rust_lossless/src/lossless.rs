@@ -3,20 +3,21 @@ use clarabel::solver::*;
 use std::time::Instant;
 
 const GRAVITY: [f64; 3] = [0.0, 0.0, -9.81];
+// Prevents 1 / tan(glide_slope) from blowing up when the configured glide slope is
+// extremely small. This keeps the SOC rows numerically well-behaved.
+const GLIDE_TAN_FLOOR: f64 = 1.0e-6;
+const GROUND_Z_EPSILON: f64 = 1.0e-9;
 
 pub struct LosslessSolver {
     pub landing_point: [f64; 3],
     pub initial_position: [f64; 3],
     pub initial_velocity: [f64; 3],
     pub glide_slope: f64,
-    pub use_glide_slope: bool,
-    pub flip_glide_slope: bool,
-    pub use_terminal_lateral_soft_penalty: bool,
-    pub terminal_lateral_soft_penalty_ratio: f64,
-    pub terminal_lateral_soft_penalty_weight: f64,
+    pub use_initial_glide_slope: bool,
+    pub use_final_glide_slope: bool,
     pub use_terminal_lateral_hard_tube: bool,
-    pub terminal_lateral_hard_tube_steps: i64,
-    pub terminal_lateral_hard_tube_radius: f64,
+    pub terminal_lateral_hard_tube_time_s: f64,
+    pub terminal_lateral_hard_tube_radius_m: f64,
     pub max_velocity: f64,
     pub dry_mass: f64,
     pub fuel_mass: f64,
@@ -24,7 +25,6 @@ pub struct LosslessSolver {
     pub lower_thrust_bound: f64,
     pub upper_thrust_bound: f64,
     pub tvc_range_rad: f64,
-    pub min_time_s: f64,
     pub coarse_line_search_delta_t: f64,
     pub fine_line_search_delta_t: f64,
     pub coarse_delta_t: f64,
@@ -121,14 +121,11 @@ impl Default for LosslessSolver {
             initial_position: [0.0, 0.0, 0.0],
             initial_velocity: [0.0, 0.0, 0.0],
             glide_slope: 0.0,
-            use_glide_slope: false,
-            flip_glide_slope: false,
-            use_terminal_lateral_soft_penalty: false,
-            terminal_lateral_soft_penalty_ratio: 0.0,
-            terminal_lateral_soft_penalty_weight: 0.0,
+            use_initial_glide_slope: false,
+            use_final_glide_slope: false,
             use_terminal_lateral_hard_tube: false,
-            terminal_lateral_hard_tube_steps: 0,
-            terminal_lateral_hard_tube_radius: 0.0,
+            terminal_lateral_hard_tube_time_s: 0.0,
+            terminal_lateral_hard_tube_radius_m: 0.0,
             max_velocity: 100.0,
             dry_mass: 0.0,
             fuel_mass: 0.0,
@@ -136,7 +133,6 @@ impl Default for LosslessSolver {
             lower_thrust_bound: 0.0,
             upper_thrust_bound: 0.0,
             tvc_range_rad: (15.0_f64).to_radians(),
-            min_time_s: 6.4,
             coarse_line_search_delta_t: 1.0,
             fine_line_search_delta_t: 1.0,
             coarse_delta_t: 1.0,
@@ -158,30 +154,31 @@ impl LosslessSolver {
     pub fn solve_at_current_time(&mut self) -> SolveAttemptResult {
         let attempt_wall_start = Instant::now();
         let m0 = self.dry_mass + self.fuel_mass;
-        let use_soft_terminal_penalty = self.use_terminal_lateral_soft_penalty
-            && self.terminal_lateral_soft_penalty_ratio > 0.0
-            && self.terminal_lateral_soft_penalty_weight > 0.0;
-        let use_terminal_hard_tube = self.use_terminal_lateral_hard_tube
-            && self.terminal_lateral_hard_tube_steps > 0
-            && self.terminal_lateral_hard_tube_radius >= 0.0;
-        let terminal_hard_tube_start = (self.N - self.terminal_lateral_hard_tube_steps).max(0);
-        let soft_var_count = if use_soft_terminal_penalty { self.N } else { 0 };
-        
+        let use_terminal_lateral_hard_tube = self.use_terminal_lateral_hard_tube
+            && self.terminal_lateral_hard_tube_time_s > 0.0
+            && self.terminal_lateral_hard_tube_radius_m >= 0.0;
+        let terminal_hard_tube_steps = if use_terminal_lateral_hard_tube {
+            ((self.terminal_lateral_hard_tube_time_s / self.delta_t).ceil() as i64)
+                .clamp(0, self.N)
+        } else {
+            0
+        };
+        // Apply the tube near whichever endpoint is on the ground.
+        let initial_is_grounded = self.initial_position[2] <= GROUND_Z_EPSILON;
+        let landing_is_grounded = self.landing_point[2] <= GROUND_Z_EPSILON;
+        let terminal_hard_tube_start = (self.N - terminal_hard_tube_steps).max(0);
+
         let n_vars = 3 * (self.N + 1) // x
             + 3 * (self.N + 1) // v
             + (self.N + 1) // w
             + 3 * self.N // u
-            + self.N // sigma (thrust slack variable)
-            + soft_var_count // lateral radius epigraph (r)
-            + soft_var_count; // lateral soft-penalty slack (eta)
+            + self.N; // sigma (thrust slack variable)
 
         let idx_x = 0;
         let idx_v = idx_x + 3 * (self.N + 1);
         let idx_w = idx_v + 3 * (self.N + 1);
         let idx_u = idx_w + (self.N + 1);
         let idx_sigma = idx_u + 3 * self.N;
-        let idx_r = idx_sigma + self.N;
-        let idx_eta = idx_r + soft_var_count;
 
         /*
         Equality constraints (Ax = b)
@@ -194,7 +191,6 @@ impl LosslessSolver {
         let mut b = Vec::new();
         let mut row_counter = 0;
 
-        
         // Setting initial conditions
 
         // x0 = initial_position
@@ -225,7 +221,6 @@ impl LosslessSolver {
         row_counter += 1;
         cones.push(SupportedConeT::ZeroConeT(1));
 
-        
         // vehicle kinematics constraints
         for k in 0..self.N {
             let curr_x_offset = idx_x + 3 * k;
@@ -253,7 +248,7 @@ impl LosslessSolver {
 
                 b.push(0.0);
             }
-            row_counter += 3;  
+            row_counter += 3;
             cones.push(SupportedConeT::ZeroConeT(3));
 
             // v_{k+1} - v_k - dt * u_k = dt * g
@@ -296,7 +291,6 @@ impl LosslessSolver {
 
         // End constraints
 
-        
         // x_N = landing_point
         for i in 0..3 {
             rows.push(row_counter as usize);
@@ -340,23 +334,39 @@ impl LosslessSolver {
             // thrust bounds
             // min bound
             cones.push(SupportedConeT::NonnegativeConeT(1));
-            rows.push(row_counter as usize); cols.push(sigma_offset as usize); vals.push(-1.0); // sigma_k - sigma_min
-            rows.push(row_counter as usize); cols.push(w_offset as usize); vals.push(-sigma_min_coefficient);
+            rows.push(row_counter as usize);
+            cols.push(sigma_offset as usize);
+            vals.push(-1.0); // sigma_k - sigma_min
+            rows.push(row_counter as usize);
+            cols.push(w_offset as usize);
+            vals.push(-sigma_min_coefficient);
             b.push(-sigma_min_h_val);
             row_counter += 1;
-            
+
             // max bound
             cones.push(SupportedConeT::NonnegativeConeT(1));
-            rows.push(row_counter as usize); cols.push(sigma_offset as usize); vals.push(1.0); // -sigma_k + sigma_max
-            rows.push(row_counter as usize); cols.push(w_offset as usize); vals.push(sigma_max_coefficient);
+            rows.push(row_counter as usize);
+            cols.push(sigma_offset as usize);
+            vals.push(1.0); // -sigma_k + sigma_max
+            rows.push(row_counter as usize);
+            cols.push(w_offset as usize);
+            vals.push(sigma_max_coefficient);
             b.push(sigma_max_h_val);
             row_counter += 1;
 
             // ---------- Thrust magnitude SOC: ||u_k|| <= sigma_k ----------
-            rows.push((row_counter as usize) + 0); cols.push(sigma_offset as usize); vals.push(-1.0); // -sigma_k
-            rows.push((row_counter as usize) + 1); cols.push(u_offset as usize);     vals.push(-1.0); // -u0
-            rows.push((row_counter as usize) + 2); cols.push((u_offset as usize) + 1);   vals.push(-1.0); // -u1
-            rows.push((row_counter as usize) + 3); cols.push((u_offset as usize) + 2);   vals.push(-1.0); // -u2
+            rows.push((row_counter as usize) + 0);
+            cols.push(sigma_offset as usize);
+            vals.push(-1.0); // -sigma_k
+            rows.push((row_counter as usize) + 1);
+            cols.push(u_offset as usize);
+            vals.push(-1.0); // -u0
+            rows.push((row_counter as usize) + 2);
+            cols.push((u_offset as usize) + 1);
+            vals.push(-1.0); // -u1
+            rows.push((row_counter as usize) + 3);
+            cols.push((u_offset as usize) + 2);
+            vals.push(-1.0); // -u2
             cones.push(SupportedConeT::SecondOrderConeT(4));
             b.push(0.0);
             b.push(0.0);
@@ -365,13 +375,27 @@ impl LosslessSolver {
             row_counter += 4;
 
             // ---------- Thrust pointing SOC: ||u_k - sigma_k*d|| <= sigma_k*sin(theta) ----------
-            rows.push((row_counter as usize) + 0); cols.push(sigma_offset as usize); vals.push(-sin_theta); // top of SOC
-            rows.push((row_counter as usize) + 1); cols.push(u_offset as usize);     vals.push(1.0);
-            rows.push((row_counter as usize) + 1); cols.push(sigma_offset as usize);     vals.push(-self.pointing_direction[0]);
-            rows.push((row_counter as usize) + 2); cols.push((u_offset as usize) + 1);   vals.push(1.0);
-            rows.push((row_counter as usize) + 2); cols.push(sigma_offset as usize);     vals.push(-self.pointing_direction[1]);
-            rows.push((row_counter as usize) + 3); cols.push((u_offset as usize) + 2);   vals.push(1.0);
-            rows.push((row_counter as usize) + 3); cols.push(sigma_offset as usize);     vals.push(-self.pointing_direction[2]);
+            rows.push((row_counter as usize) + 0);
+            cols.push(sigma_offset as usize);
+            vals.push(-sin_theta); // top of SOC
+            rows.push((row_counter as usize) + 1);
+            cols.push(u_offset as usize);
+            vals.push(1.0);
+            rows.push((row_counter as usize) + 1);
+            cols.push(sigma_offset as usize);
+            vals.push(-self.pointing_direction[0]);
+            rows.push((row_counter as usize) + 2);
+            cols.push((u_offset as usize) + 1);
+            vals.push(1.0);
+            rows.push((row_counter as usize) + 2);
+            cols.push(sigma_offset as usize);
+            vals.push(-self.pointing_direction[1]);
+            rows.push((row_counter as usize) + 3);
+            cols.push((u_offset as usize) + 2);
+            vals.push(1.0);
+            rows.push((row_counter as usize) + 3);
+            cols.push(sigma_offset as usize);
+            vals.push(-self.pointing_direction[2]);
             cones.push(SupportedConeT::SecondOrderConeT(4));
             b.push(0.0);
             b.push(0.0);
@@ -379,81 +403,114 @@ impl LosslessSolver {
             b.push(0.0);
             row_counter += 4;
 
-            if self.use_glide_slope {
-                // ---------- Glide slope SOC: ||x_k[:2]|| <= x_k[2] / tan(glide_slope) ----------
+            let apply_initial_hard_tube =
+                use_terminal_lateral_hard_tube && initial_is_grounded && k < terminal_hard_tube_steps;
+            let apply_landing_hard_tube =
+                use_terminal_lateral_hard_tube && landing_is_grounded && k >= terminal_hard_tube_start;
+
+            if apply_initial_hard_tube {
                 let x_offset = idx_x + 3 * k;
-                if self.flip_glide_slope {
-                    rows.push((row_counter as usize) + 0); cols.push((x_offset as usize) + 2); vals.push(1.0 / self.glide_slope.tan()); // x_k[2]
-                } else {
-                    rows.push((row_counter as usize) + 0); cols.push((x_offset as usize) + 2); vals.push(-1.0 / self.glide_slope.tan()); // x_k[2]
-                }
-                rows.push((row_counter as usize) + 1); cols.push((x_offset as usize) + 0); vals.push(1.0); // -x_k[0]
-                rows.push((row_counter as usize) + 2); cols.push((x_offset as usize) + 1); vals.push(1.0); // -x_k[1]
+
+                // ---------- Hard lateral tube near the grounded initial endpoint ----------
+                rows.push((row_counter as usize) + 1);
+                cols.push((x_offset as usize) + 0);
+                vals.push(1.0);
+                rows.push((row_counter as usize) + 2);
+                cols.push((x_offset as usize) + 1);
+                vals.push(1.0);
                 cones.push(SupportedConeT::SecondOrderConeT(3));
-                b.push(0.0);
+                b.push(self.terminal_lateral_hard_tube_radius_m);
+                b.push(self.initial_position[0]);
+                b.push(self.initial_position[1]);
+                row_counter += 3;
+            }
+
+            if apply_landing_hard_tube {
+                let x_offset = idx_x + 3 * k;
+
+                // ---------- Hard lateral tube near the grounded landing endpoint ----------
+                rows.push((row_counter as usize) + 1);
+                cols.push((x_offset as usize) + 0);
+                vals.push(1.0);
+                rows.push((row_counter as usize) + 2);
+                cols.push((x_offset as usize) + 1);
+                vals.push(1.0);
+                cones.push(SupportedConeT::SecondOrderConeT(3));
+                b.push(self.terminal_lateral_hard_tube_radius_m);
                 b.push(self.landing_point[0]);
                 b.push(self.landing_point[1]);
                 row_counter += 3;
             }
 
-            if use_terminal_hard_tube && k >= terminal_hard_tube_start {
-                let x_offset = idx_x + 3 * k;
-
-                // ---------- Hard terminal lateral tube: ||x_k[:2] - x_f[:2]|| <= radius ----------
-                rows.push((row_counter as usize) + 1); cols.push((x_offset as usize) + 0); vals.push(1.0);
-                rows.push((row_counter as usize) + 2); cols.push((x_offset as usize) + 1); vals.push(1.0);
-                cones.push(SupportedConeT::SecondOrderConeT(3));
-                b.push(self.terminal_lateral_hard_tube_radius);
-                b.push(self.landing_point[0]);
-                b.push(self.landing_point[1]);
-                row_counter += 3;
-            }
-
-            if use_soft_terminal_penalty {
-                let x_offset = idx_x + 3 * k;
-                let r_offset = idx_r + k;
-                let eta_offset = idx_eta + k;
-                let soft_kappa = self.terminal_lateral_soft_penalty_ratio;
-
-                // ---------- Lateral radius epigraph: ||x_k[:2] - x_f[:2]|| <= r_k ----------
-                rows.push((row_counter as usize) + 0); cols.push(r_offset as usize); vals.push(-1.0);
-                rows.push((row_counter as usize) + 1); cols.push((x_offset as usize) + 0); vals.push(1.0);
-                rows.push((row_counter as usize) + 2); cols.push((x_offset as usize) + 1); vals.push(1.0);
-                cones.push(SupportedConeT::SecondOrderConeT(3));
-                b.push(0.0);
-                b.push(self.landing_point[0]);
-                b.push(self.landing_point[1]);
-                row_counter += 3;
-
-                // ---------- Soft corridor linear bound: r_k <= kappa*(z_k - z_f) + eta_k ----------
-                rows.push(row_counter as usize); cols.push(r_offset as usize); vals.push(1.0);
-                rows.push(row_counter as usize); cols.push((x_offset as usize) + 2); vals.push(-soft_kappa);
-                rows.push(row_counter as usize); cols.push(eta_offset as usize); vals.push(-1.0);
-                cones.push(SupportedConeT::NonnegativeConeT(1));
-                b.push(-soft_kappa * self.landing_point[2]);
-                row_counter += 1;
-
-                // ---------- eta_k >= 0 ----------
-                rows.push(row_counter as usize); cols.push(eta_offset as usize); vals.push(-1.0);
-                cones.push(SupportedConeT::NonnegativeConeT(1));
-                b.push(0.0);
-                row_counter += 1;
-            }
-
-            
             // ---------- Max velocity SOC: ||v_k|| <= max_velocity ----------
             // rows.push((row_counter as usize) + 0); cols.push(v_offset as usize);     vals.push(0.0); // -v0
             // No need to push a zero value
-            rows.push((row_counter as usize) + 1); cols.push(v_offset as usize);     vals.push(-1.0); // -v0
-            rows.push((row_counter as usize) + 2); cols.push((v_offset as usize) + 1);   vals.push(-1.0); // -v1
-            rows.push((row_counter as usize) + 3); cols.push((v_offset as usize) + 2);   vals.push(-1.0); // -v2
+            rows.push((row_counter as usize) + 1);
+            cols.push(v_offset as usize);
+            vals.push(-1.0); // -v0
+            rows.push((row_counter as usize) + 2);
+            cols.push((v_offset as usize) + 1);
+            vals.push(-1.0); // -v1
+            rows.push((row_counter as usize) + 3);
+            cols.push((v_offset as usize) + 2);
+            vals.push(-1.0); // -v2
             cones.push(SupportedConeT::SecondOrderConeT(4));
             b.push(self.max_velocity);
             b.push(0.0);
             b.push(0.0);
             b.push(0.0);
             row_counter += 4;
+        }
 
+        if self.use_initial_glide_slope || self.use_final_glide_slope {
+            // The glide-slope corridor scales allowable lateral displacement with
+            // vertical separation from an anchor point. We use tan(gamma) as the
+            // slope parameter, with a floor for numerical safety.
+            let glide_tan = self.glide_slope.tan();
+            let glide_tan_safe = if glide_tan >= 0.0 {
+                glide_tan.max(GLIDE_TAN_FLOOR)
+            } else {
+                glide_tan.min(-GLIDE_TAN_FLOOR)
+            };
+            for k in 0..=self.N {
+                let x_offset = idx_x + 3 * k;
+
+                if self.use_final_glide_slope {
+                    // Final-endpoint cone:
+                    //   if z_0 >= z_f: ||[x_k - x_f, y_k - y_f]||_2 <= (z_k - z_f) / tan(gamma)
+                    //   else         : ||[x_k - x_f, y_k - y_f]||_2 <= (z_f - z_k) / tan(gamma)
+                    Self::push_glide_slope_soc(
+                        &mut rows,
+                        &mut cols,
+                        &mut vals,
+                        &mut b,
+                        &mut cones,
+                        &mut row_counter,
+                        x_offset,
+                        self.landing_point,
+                        glide_tan_safe,
+                        self.initial_position[2] < self.landing_point[2],
+                    );
+                }
+
+                if self.use_initial_glide_slope {
+                    // Initial-endpoint cone:
+                    //   if z_0 >= z_f: ||[x_k - x_0, y_k - y_0]||_2 <= (z_0 - z_k) / tan(gamma)
+                    //   else         : ||[x_k - x_0, y_k - y_0]||_2 <= (z_k - z_0) / tan(gamma)
+                    Self::push_glide_slope_soc(
+                        &mut rows,
+                        &mut cols,
+                        &mut vals,
+                        &mut b,
+                        &mut cones,
+                        &mut row_counter,
+                        x_offset,
+                        self.initial_position,
+                        glide_tan_safe,
+                        self.initial_position[2] >= self.landing_point[2],
+                    );
+                }
+            }
         }
 
         // ---------- End mass SOC: w_N >= log(m_dry) ----------
@@ -463,7 +520,7 @@ impl LosslessSolver {
         cones.push(SupportedConeT::NonnegativeConeT(1));
         b.push(-self.dry_mass.ln());
         row_counter += 1;
-        
+
         let A = Self::csc_from_triplets(row_counter as usize, n_vars as usize, &rows, &cols, &vals);
 
         /*
@@ -473,24 +530,22 @@ impl LosslessSolver {
         let mut c = vec![0.0; n_vars as usize];
         // sigma variables start at idx_sigma
         for k in 0..self.N {
-            c[(idx_sigma + k) as usize] = self.delta_t; // weight = delta_t for discretization  
+            c[(idx_sigma + k) as usize] = self.delta_t; // weight = delta_t for discretization
         }
-        if use_soft_terminal_penalty {
-            for k in 0..soft_var_count {
-                c[(idx_eta + k) as usize] =
-                    self.terminal_lateral_soft_penalty_weight * self.delta_t;
-            }
-        }
-
 
         let prow = Vec::new();
         let pcol = Vec::new();
         let pval = Vec::new();
-        let P = LosslessSolver::csc_from_triplets(n_vars as usize, n_vars as usize, &prow, &pcol, &pval);
+        let P = LosslessSolver::csc_from_triplets(
+            n_vars as usize,
+            n_vars as usize,
+            &prow,
+            &pcol,
+            &pval,
+        );
 
         let mut settings = DefaultSettings::default();
-        settings.verbose = true;
-        // settings.verbose = false;
+        settings.verbose = false;
 
         // Build the solver
         let mut solver = DefaultSolver::new(
@@ -510,15 +565,19 @@ impl LosslessSolver {
             attempt_wall_start.elapsed().as_secs_f64(),
         );
 
-        if solver.solution.status == SolverStatus::Solved || solver.solution.status == SolverStatus::AlmostSolved {
+        if solver.solution.status == SolverStatus::Solved
+            || solver.solution.status == SolverStatus::AlmostSolved
+        {
             let traj_result = self.extract_result(&solver.solution);
             SolveAttemptResult {
                 trajectory: Some(traj_result),
                 metrics,
             }
-            
         } else {
-            println!("{}", format!("Solver failed with status {:?}", solver.solution.status));
+            println!(
+                "{}",
+                format!("Solver failed with status {:?}", solver.solution.status)
+            );
             SolveAttemptResult {
                 trajectory: None,
                 metrics,
@@ -526,8 +585,17 @@ impl LosslessSolver {
         }
     }
 
-    pub fn csc_from_triplets(nrows: usize, ncols: usize, rows: &[usize], cols: &[usize], vals: &[f64]) -> CscMatrix<f64> {
-        let mut triplets: Vec<(usize, usize, f64)> = rows.iter().zip(cols).zip(vals)
+    pub fn csc_from_triplets(
+        nrows: usize,
+        ncols: usize,
+        rows: &[usize],
+        cols: &[usize],
+        vals: &[f64],
+    ) -> CscMatrix<f64> {
+        let mut triplets: Vec<(usize, usize, f64)> = rows
+            .iter()
+            .zip(cols)
+            .zip(vals)
             .map(|((r, c), v)| (*r, *c, *v))
             .collect();
         triplets.sort_by_key(|&(r, c, _)| (c, r));
@@ -556,6 +624,61 @@ impl LosslessSolver {
         CscMatrix::new(nrows, ncols, colptr, rowval, nzval)
     }
 
+    fn push_glide_slope_soc(
+        rows: &mut Vec<usize>,
+        cols: &mut Vec<usize>,
+        vals: &mut Vec<f64>,
+        b: &mut Vec<f64>,
+        cones: &mut Vec<SupportedConeT<f64>>,
+        row_counter: &mut i64,
+        x_offset: i64,
+        anchor: [f64; 3],
+        glide_tan: f64,
+        upper_bound: bool,
+    ) {
+        // This helper encodes one glide-slope bound in SOC form.
+        //
+        // Desired constraint about anchor a = [a_x, a_y, a_z]:
+        //
+        //   ||[x_k - a_x, y_k - a_y]||_2 <= (z_k - a_z) / tan(gamma)   lower-bound cone
+        //
+        // or
+        //
+        //   ||[x_k - a_x, y_k - a_y]||_2 <= (a_z - z_k) / tan(gamma)   upper-bound cone
+        //
+        // Clarabel takes SOC blocks as ||u||_2 <= t. We therefore assemble:
+        //
+        //   u = [x_k - a_x, y_k - a_y]
+        //   t = +/- z_k / tan(gamma)  +/- a_z / tan(gamma)
+        //
+        // with the sign chosen by `upper_bound`.
+        let top_coeff = if upper_bound {
+            1.0 / glide_tan
+        } else {
+            -1.0 / glide_tan
+        };
+        let top_rhs = anchor[2] / glide_tan;
+        let top_rhs = if upper_bound { top_rhs } else { -top_rhs };
+
+        rows.push(*row_counter as usize);
+        cols.push((x_offset + 2) as usize);
+        vals.push(top_coeff);
+
+        rows.push((*row_counter as usize) + 1);
+        cols.push(x_offset as usize);
+        vals.push(1.0);
+
+        rows.push((*row_counter as usize) + 2);
+        cols.push((x_offset + 1) as usize);
+        vals.push(1.0);
+
+        cones.push(SupportedConeT::SecondOrderConeT(3));
+        b.push(top_rhs);
+        b.push(anchor[0]);
+        b.push(anchor[1]);
+        *row_counter += 3;
+    }
+
     fn extract_result(&self, result: &DefaultSolution<f64>) -> TrajectoryResult {
         let x = &result.x;
 
@@ -574,21 +697,13 @@ impl LosslessSolver {
         // positions (x_k)
         for k in 0..=self.N {
             let start: usize = (idx_x + 3 * k) as usize;
-            positions.push([
-                x[start],
-                x[start + 1],
-                x[start + 2],
-            ]);
+            positions.push([x[start], x[start + 1], x[start + 2]]);
         }
 
         // velocities (v_k)
         for k in 0..=self.N {
             let start: usize = (idx_v + 3 * k) as usize;
-            velocities.push([
-                x[start],
-                x[start + 1],
-                x[start + 2],
-            ]);
+            velocities.push([x[start], x[start + 1], x[start + 2]]);
         }
 
         // log-masses (w_k)
@@ -599,11 +714,7 @@ impl LosslessSolver {
         // thrusts (u_k)
         for k in 0..self.N {
             let start: usize = (idx_u + 3 * k) as usize;
-            thrusts.push([
-                x[start],
-                x[start + 1],
-                x[start + 2],
-            ]);
+            thrusts.push([x[start], x[start + 1], x[start + 2]]);
         }
 
         // sigmas (σ_k)
@@ -626,12 +737,19 @@ impl LosslessSolver {
         self.start_time = Instant::now();
         self.delta_t = self.coarse_delta_t;
 
-        let t_min = self.min_time_s;
+        let vel_norm = self
+            .initial_velocity
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let t_min = self.dry_mass * vel_norm / self.upper_thrust_bound;
         let t_max = self.fuel_mass / (self.alpha * self.lower_thrust_bound);
 
         let coarse_n_min = (t_min / self.delta_t).ceil() as i64;
         let coarse_n_max = (t_max / self.delta_t).floor() as i64;
-        let coarse_n_step = ((self.coarse_line_search_delta_t / self.delta_t).round() as i64).max(1);
+        let coarse_n_step =
+            ((self.coarse_line_search_delta_t / self.delta_t).round() as i64).max(1);
 
         let mut traj_result: Option<TrajectoryResult> = None;
         let mut coarse_metrics = SolveMetrics::default();
@@ -646,11 +764,14 @@ impl LosslessSolver {
             coarse_metrics.accumulate(&attempt.metrics);
             match attempt.trajectory {
                 Some(sol) => {
-                    println!("✅ Step {} converged successfully with tof {:.2} s.", k, sol.time_of_flight_s);
+                    println!(
+                        "✅ Step {} converged successfully with tof {:.2} s.",
+                        k, sol.time_of_flight_s
+                    );
                     coarse_time_of_flight_s = Some(sol.time_of_flight_s);
                     traj_result = Some(sol);
                     break;
-                },
+                }
                 None => println!("Failed to converge at step {}.", k),
             }
 
@@ -685,12 +806,17 @@ impl LosslessSolver {
             let attempt = self.solve_at_current_time();
             match attempt.trajectory {
                 Some(sol) => {
-                    println!("✅ Fine solve converged successfully with tof {:.2} s.", sol.time_of_flight_s);
+                    println!(
+                        "✅ Fine solve converged successfully with tof {:.2} s.",
+                        sol.time_of_flight_s
+                    );
                     fine_time_of_flight_s = Some(sol.time_of_flight_s);
                     traj_result = Some(sol);
                     fine_metrics.accumulate(&attempt.metrics);
-                    // break;
-                },
+
+                    // comment this line to perform a line search backwards for the "most optimal" (takes longer)
+                    break;
+                }
                 None => {
                     println!("Failed to converge at step {}.", k);
                     break;

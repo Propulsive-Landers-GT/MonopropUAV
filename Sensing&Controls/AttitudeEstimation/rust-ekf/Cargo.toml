@@ -3,6 +3,10 @@ name = "rust-ekf"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "attitude_test"
+path = "src/testing/attitude_test.rs"
+
 [dependencies]
 ndarray = "0.15"
 nalgebra = "0.32"
