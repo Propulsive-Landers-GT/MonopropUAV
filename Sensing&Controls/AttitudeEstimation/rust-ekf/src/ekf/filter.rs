@@ -18,7 +18,7 @@ pub struct ExtendedKalmanFilter<T: EKFModel> {
 impl<T: EKFModel> ExtendedKalmanFilter<T> {
     pub fn new(
         initial_state: Array1<f64>,
-        initial_measurements: Array1<f64>,
+        _initial_measurements: Array1<f64>,
         delta_time: f64,
         q: Array2<f64>, // Should be the size of the state
         r: Array2<f64>, // Should be the size of the measurement

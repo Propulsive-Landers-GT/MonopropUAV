@@ -41,8 +41,10 @@ def plot_trajectory_3d(csv_path: Path) -> None:
 
     max_num = max(max(x), max(y), max(z))
     # max_num = max(max(x), max(y), max(z)) / 10
-    ax.set_xlim(-max_num/4, max_num/2)
-    ax.set_ylim(-max_num/4, max_num/2)
+    # ax.set_xlim(-max_num/4, max_num/2)
+    ax.set_xlim(-max_num/2, max_num)
+    # ax.set_ylim(-max_num/4, max_num/2)
+    ax.set_ylim(-max_num/2, max_num)
     ax.set_zlim(0, max_num)
 
     ax.set_xlabel("x [m]")
@@ -68,7 +70,7 @@ def resolve_csv_files(args: list[str], project_root: Path) -> list[Path]:
 
     inspect_dir = project_root / "to_inspect"
     inspect_dir.mkdir(parents=True, exist_ok=True)
-    return sorted(inspect_dir.glob("trajectory_*.csv"))
+    return sorted(inspect_dir.glob("trajectory*.csv"))
 
 
 def main() -> None:
@@ -78,7 +80,7 @@ def main() -> None:
     parser.add_argument(
         "csv_files",
         nargs="*",
-        help="Optional CSV paths. Defaults to to_inspect/trajectory_*.csv",
+        help="Optional CSV paths. Defaults to to_inspect/trajectory*.csv",
     )
     parsed = parser.parse_args()
 
@@ -86,7 +88,7 @@ def main() -> None:
     csv_files = resolve_csv_files(parsed.csv_files, project_root)
 
     if not csv_files:
-        print(f"No files found matching trajectory_*.csv in {project_root / 'to_inspect'}")
+        print(f"No files found matching trajectory*.csv in {project_root / 'to_inspect'}")
         return
 
     for csv_path in csv_files:

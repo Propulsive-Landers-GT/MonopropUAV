@@ -75,6 +75,20 @@ impl AeroTable {
 
         Ok(Self { alphas, machs, grid })
     }
+
+    pub fn default() -> Option<Self> {
+        // Load aero table from root. Fail gracefully if missing.
+        match crate::aero_tables::AeroTable::from_csv("aero_table.csv") {
+            Ok(t) => {
+                // println!("Successfully loaded aero_table.csv");
+                Some(t)
+            },
+            Err(e) => {
+                eprintln!("Warning: Failed to load aero lookup table ({}); falling back to static drag.", e);
+                None
+            }
+        }
+    }
 }
 
 // ─── Lookup (public API) ──────────────────────────────────────────────────────

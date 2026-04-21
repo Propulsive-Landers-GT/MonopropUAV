@@ -53,8 +53,8 @@ fn main() {
         tvc_range_rad: 15_f64.to_radians(), // This is the range from the vertical axis that the thrust vector control can deviate.
         coarse_delta_t: 0.5, // This is the dt used to solve for the time frame of the trajectory.
         fine_delta_t: 0.05, // This is the dt used to solve for the higher resolution trajectory.
-        use_glide_slope: false, // This determines if the glide slope constraint is used. The glide slope constraint ensures that the vehicle stays above an upward spreading cone centered on the landing point.
-        glide_slope: 5_f64.to_radians(), // This is the angle of the glide slope constraint.
+        use_glide_slope: false, // Enables the glide-slope corridor constraint.
+        glide_slope: 5_f64.to_radians(), // Half-angle used to define the allowable lateral-vs-vertical excursion from each endpoint.
         N: 20, // This is the number of time steps the solver uses. It is set here, but is recalculated internally solve() is called. This is simply exposed so that the number of time steps can be accessed externally, if necessary.
         ..Default::default()
     };
@@ -79,11 +79,48 @@ fn main() {
 }
 ```
 
+**Glide Slope Constraint**
+
+The Rust ZOH lossless solver does not use the older one-sided "stay above the landing cone" interpretation anymore. Instead, it applies a two-sided corridor between the start point and end point.
+
+Let the state position at step `k` be `p_k = [x_k, y_k, z_k]^T`, and let `p_s` and `p_f` be the start and finish positions. Define the lateral distance from an anchor point `a` as:
+
+```text
+r_a(p_k) = || [x_k - a_x, y_k - a_y] ||_2
+```
+
+For a glide-slope angle `gamma`, the solver enforces:
+
+```text
+r_a(p_k) <= |z_k - a_z| / tan(gamma)
+```
+
+using second-order-cone constraints. The solver applies those cones from both endpoints, but with the direction chosen so the trajectory stays between the endpoint altitudes:
+
+- If `z_start >= z_end`, then every node must stay above the landing-point cone and below the start-point cone.
+- If `z_start < z_end`, then every node must stay above the start-point cone and below the landing-point cone.
+
+That means the trajectory is kept inside a corridor that widens laterally away from each endpoint while also preventing the rocket from going far above the higher endpoint or far below the lower endpoint.
+
+Mathematically, each bound is written in SOC form as either:
+
+```text
+|| [x_k - a_x, y_k - a_y] ||_2 <= (z_k - a_z) / tan(gamma)
+```
+
+or
+
+```text
+|| [x_k - a_x, y_k - a_y] ||_2 <= (a_z - z_k) / tan(gamma)
+```
+
+depending on whether that anchor provides the lower or upper vertical bound.
+
 ### Chebyshev Rust Lossless (chebyshev_lossless.rs)
 This is currently incomplete and mostly a copy of `lossless.rs` with some TODO comments attached to areas that need to be changed for the Chebyshev parametization version of the lossless problem. However, in the future, it should function similarly to `lossless.rs` and contain a solver struct that returns a `TrajectoryResult` struct.
 
 ### Python Lossless (lossless.py)
-This is fairly straightforward to use. Since this is mostly just a rough draft, it is not intended to be instantiated into other Python classes. TO change parameters, adjust lines `123-141` for the initial constraints and rough `dt` and see line `247` for the fine `dt`. Additionally, uncomment lines `100-104` to activate the glide slope constraint. For our purposes, the glide slope constraint usually is not all that useful.
+This is fairly straightforward to use. Since this is mostly just a rough draft, it is not intended to be instantiated into other Python classes. TO change parameters, adjust lines `123-141` for the initial constraints and rough `dt` and see line `247` for the fine `dt`. The Python file still contains the older commented one-sided glide-slope cone near the landing point; the Rust ZOH solver is the more up-to-date reference for the current two-sided corridor implementation.
 To actually run it, simply activate the venv then run `python3 lossless.py` from the main `LosslessConvexification` folder. It should automatically save images and plots of the trajectory, as well as produce a CSV file containing the trajectory information.
 
 ### Python Venvs (lossless_venv.sh)

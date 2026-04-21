@@ -78,10 +78,11 @@ pub struct Rocket {
 
     // Optional aerodynamic lookup table — None falls back to the hard-coded drag model.
     pub aero_table: Option<AeroTable>,
+
     // Distance from the rocket's body-frame origin (frame CoM reference) to the
-    // physical nose tip, measured along the body Z axis (positive = aft of nose).
-    // Used to convert cp_z_from_nose into a lever arm relative to the current CoM.
-    pub nose_offset_z: f64,
+    // physical nose tip, as a 3D vector.
+    // Used to convert the center of pressure to rocket body frame coordinates.
+    pub nose_offset: Vector3<f64>,
 
     system_time: f64,
 
@@ -116,6 +117,39 @@ pub struct RocketDebugInfo{
     pub imu_readings: Vec<IMUReading>,
     pub gps_readings: Vec<GPSReading>,
     pub uwb_readings: Vec<UWBReading>,
+}
+
+impl RocketDebugInfo {
+    pub fn default() -> Self {
+        Self {
+            thrust_torque: Vector3::zeros(),
+            total_force: Vector3::zeros(),
+            total_torque: Vector3::zeros(),
+            times: Vec::new(),
+            com_offsets: Vec::new(),
+            mois: Vec::new(),
+            thrusts: Vec::new(),
+            slosh_forces: Vec::new(),
+            nitrous_m_dots: Vec::new(),
+            valve_angles: Vec::new(),
+            chamber_pressures: Vec::new(),
+            of_ratios: Vec::new(),
+            isps: Vec::new(),
+            cstars: Vec::new(),
+            port_ds: Vec::new(),
+            fuel_masses: Vec::new(),
+            nitrous_masses: Vec::new(),
+            nitrogen_n2_tank_masses: Vec::new(),
+            nitrogen_n2o_tank_masses: Vec::new(),
+            wind_vels: Vec::new(),
+            aero_drags: Vec::new(),
+            aero_moments: Vec::new(),
+            attitudes: Vec::new(),
+            imu_readings: Vec::new(),
+            gps_readings: Vec::new(),
+            uwb_readings: Vec::new(),
+        }
+    }
 }
 
 impl Rocket {
@@ -172,36 +206,9 @@ impl Rocket {
             com_to_ground,
             wind_model,
             aero_table,
-            nose_offset_z,
+            nose_offset,
             system_time: 0.0,
-            debug_info: RocketDebugInfo {
-                thrust_torque: Vector3::zeros(),
-                total_force: Vector3::zeros(),
-                total_torque: Vector3::zeros(),
-                times: Vec::new(),
-                com_offsets: Vec::new(),
-                mois: Vec::new(),
-                thrusts: Vec::new(),
-                slosh_forces: Vec::new(),
-                nitrous_m_dots: Vec::new(),
-                valve_angles: Vec::new(),
-                chamber_pressures: Vec::new(),
-                of_ratios: Vec::new(),
-                isps: Vec::new(),
-                cstars: Vec::new(),
-                port_ds: Vec::new(),
-                fuel_masses: Vec::new(),
-                nitrous_masses: Vec::new(),
-                nitrogen_n2_tank_masses: Vec::new(),
-                nitrogen_n2o_tank_masses: Vec::new(),
-                wind_vels: Vec::new(),
-                aero_drags: Vec::new(),
-                aero_moments: Vec::new(),
-                attitudes: Vec::new(),
-                imu_readings: Vec::new(),
-                gps_readings: Vec::new(),
-                uwb_readings: Vec::new(),
-            },
+            debug_info: RocketDebugInfo::default(),
         };
 
         rocket.imu.update(rocket.accel, rocket.ang_vel, rocket.attitude, rocket.system_time);
@@ -282,32 +289,16 @@ impl Rocket {
 
         let com_to_ground = Vector3::new(0.0, 0.0, -1.5);
 
+        // let wind_model = Some(WindModel::default());
+        let wind_model = None;
 
-        Self::new(position, velocity, acceleration, attitude, angular_velocity, angular_acceleration, frame_mass, nitrogen_tank_empty_mass, starting_nitrogen_mass, nitrogen_tank_offset, nitrous_tank_empty_mass, starting_pressurizing_nitrogen_mass, starting_nitrous_mass, nitrous_tank_offset, tvc_module_empty_mass, starting_fuel_grain_mass, frame_com_to_gimbal, gimbal_to_tvc_com, frame_moi, dry_nitrogen_moi, wet_nitrogen_moi, nitrous_tank_radius, nitrous_tank_length, nitrous_level, dry_nitrous_moi, dry_tvc_moi, wet_tvc_moi, tvc_range, tvc, rcs, fill_mv, r_mv, rcs1_mv, rcs2_mv, o_iso, o_vnt, imu, gps, uwb, slosh_model, thermo_fluid_solver, com_to_ground, None, 0.0, None)
-    }
+        let aero_table = AeroTable::default();
+      
+        let nose_offset = Vector3::new(0.0, 0.0, 1.5); // TODO: change this to a proper value once frame is re-cadded
 
-fn get_wind_model() -> WindModel {
-    // Altitude-keyed mean wind profile [m/s], world frame (x=east, y=north, z=up).
-    // These are rough placeholder values — replace with site-specific data before flight.
-    let profile = WindProfile::new(vec![
-        WindBand { altitude_m:  0.0, wind_mps: Vector3::new(2.0, 0.0, 0.0) },   // near-ground, light crosswind
-        WindBand { altitude_m: 15.0, wind_mps: Vector3::new(5.0, 1.0, 0.0) },   // mid-range, picking up
-        WindBand { altitude_m: 35.0, wind_mps: Vector3::new(8.0, 3.0, 0.0) },   // upper range, higher shear
-        WindBand { altitude_m: 60.0, wind_mps: Vector3::new(10.0, 4.0, 0.0) },  // near apogee
-    ]);
+        Self::new(position, velocity, acceleration, attitude, angular_velocity, angular_acceleration, frame_mass, nitrogen_tank_empty_mass, starting_nitrogen_mass, nitrogen_tank_offset, nitrous_tank_empty_mass, starting_pressurizing_nitrogen_mass, starting_nitrous_mass, nitrous_tank_offset, tvc_module_empty_mass, starting_fuel_grain_mass, frame_com_to_gimbal, gimbal_to_tvc_com, frame_moi, dry_nitrogen_moi, wet_nitrogen_moi, nitrous_tank_radius, nitrous_tank_length, nitrous_level, dry_nitrous_moi, dry_tvc_moi, wet_tvc_moi, tvc_range, tvc, rcs, fill_mv, r_mv, rcs1_mv, rcs2_mv, o_iso, o_vnt, imu, gps, uwb, slosh_model, thermo_fluid_solver, com_to_ground, wind_model, aero_table, nose_offset)
 
-    // Gauss-Markov turbulence: sigma is how intense, tau is how "smooth" gusts are.
-    // One-shot peak gust fires at t=5s for 0.5s to stress-test the controller early.
-    let gusts = GustModel::new(
-        Vector3::new(1.5, 1.0, 0.3), // sigma [m/s] per axis
-        3.0,                          // tau [s] — 3 seconds is realistic for low-altitude turbulence
-        Vector3::new(4.0, 0.0, 0.0), // peak gust direction + magnitude [m/s]
-        5.0,                          // gust starts at t=5s
-        0.5,                          // gust lasts 0.5s
-    );
 
-    WindModel::new(profile, gusts)
-}
     /// Update state based on applied forces and torques
     /// forces: Force vector in World Frame
     /// torques: Torque vector in Body Frame
@@ -344,9 +335,8 @@ fn get_wind_model() -> WindModel {
 
         let com_offset = self.get_com_offset(self.thrust_vector);
         self.moi = self.get_moi(self.thrust_vector, com_offset);
-        println!("ROCKET MOI: {:?}", self.moi);
-        println!("TVC_LEVER_ARM: {:?}", self.frame_com_to_gimbal - com_offset);
-        // std::process::exit(0);
+        // println!("ROCKET MOI: {:?}", self.moi);
+        // println!("TVC_LEVER_ARM: {:?}", self.frame_com_to_gimbal - com_offset);
 
         // Update actuated devices
         let tvc_effect: TVCEffect = self.tvc.update(Vector3::new(control_input.x, control_input.y, control_input.z), self.frame_com_to_gimbal - com_offset, self.nitrogen_mass, self.pressurizing_nitrogen_mass, self.nitrous_mass, self.fuel_grain_mass, dt, self.system_time);
@@ -412,6 +402,7 @@ fn get_wind_model() -> WindModel {
         let mass = self.get_mass();
 
         let slosh_force = self.sloshing_model.step(dt, self.accel, self.attitude, self.nitrous_m_dot);
+        // let slosh_force = Vector3::zeros();
 
         // Translational Dynamics
         let gravity = Vector3::new(0.0, 0.0, -9.81);
@@ -465,8 +456,8 @@ fn get_wind_model() -> WindModel {
             // Bilinear lookup — both axes are clamped inside lookup() so no panic here.
             let rec = table.lookup(alpha_deg, mach);
 
-            let q_dyn     = 0.5 * rho * speed * speed;   // dynamic pressure [Pa]
-            let drag_mag  = q_dyn * rec.cd * rec.area_ref; // scalar drag force magnitude [N]
+            let q_dyn = 0.5 * rho * speed * speed;   // dynamic pressure [Pa]
+            let drag_mag = q_dyn * rec.cd * rec.area_ref; // scalar drag force magnitude [N]
 
             // Drag force vector opposes the relative wind direction, in body frame.
             let drag_body = if speed > 1e-6 {
@@ -481,8 +472,8 @@ fn get_wind_model() -> WindModel {
             // cp_z_from_nose is measured aft from nose along body Z, so is a positive number.
             // r_com_from_nose is the nose-to-CoM distance (also positive, nose is forward).
             // Subtracting gives a signed offset: positive = CP is aft of CoM (stable config).
-            let r_com_from_nose = self.get_nose_to_com_z();
-            let r_lever = Vector3::new(0.0, 0.0, rec.cp_z_from_nose - r_com_from_nose);
+            let r_com_to_nose = self.nose_offset - com_offset;
+            let r_lever = r_com_to_nose - Vector3::new(0.0, 0.0, rec.cp_z_from_nose); // TODO: in actual mode, make cp_from_nose a 3d vector
 
             // M_aero = r_lever × F_drag  (torque about CoM in body frame [N·m])
             // This stays in body frame — Euler's equations operate there directly.
@@ -568,25 +559,6 @@ fn get_wind_model() -> WindModel {
 
     pub fn get_dry_mass(&self) -> f64 {
         self.frame_mass + self.nitrogen_tank_empty_mass + self.nitrous_tank_empty_mass + self.tvc_module_empty_mass
-    }
-
-    /// Returns the signed distance from the nose tip to the current composite CoM,
-    /// measured along the body Z axis [m].
-    ///
-    /// In our body frame, +Z points from tail to nose (Z-up in world when the
-    /// rocket stands upright). nose_offset_z is the distance from the frame CoM
-    /// reference to the nose, stored as a positive number (nose is "above" CoM in Z).
-    /// We then subtract the current CoM shift to get the nose-to-CoM distance.
-    ///
-    /// This is used to compute: r_lever = cp_z_from_nose - r_com_from_nose,
-    /// which gives the moment arm from the current CoM to the pressure centre.
-    pub fn get_nose_to_com_z(&self) -> f64 {
-        // com_offset is the shift of the composite CoM from the frame CoM reference.
-        // Since the frame CoM reference is our body-frame origin, the nose sits at
-        // +nose_offset_z along body Z. The composite CoM is at com_offset.z from origin.
-        // So the nose is (nose_offset_z - com_offset.z) ahead of the current CoM.
-        let com_offset = self.get_com_offset(self.thrust_vector);
-        self.nose_offset_z - com_offset.z
     }
 
     // This is expressed as a vector offset from the frame CoM

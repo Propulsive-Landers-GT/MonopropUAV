@@ -22,6 +22,18 @@ impl WindProfile {
         Self { bands }
     }
 
+    pub fn default() -> Self {
+        // Altitude-keyed mean wind profile [m/s], world frame (x=east, y=north, z=up).
+        // These are rough placeholder values — replace with site-specific data before flight.
+        Self::new(vec![
+            WindBand { altitude_m:  0.0, wind_mps: Vector3::new(1.0, 0.0, 0.0) },   // near-ground, light crosswind
+            WindBand { altitude_m: 15.0, wind_mps: Vector3::new(2.5, 0.5, 0.0) },   // mid-range, picking up
+            WindBand { altitude_m: 35.0, wind_mps: Vector3::new(4.0, 1.5, 0.0) },   // upper range, higher shear
+            WindBand { altitude_m: 60.0, wind_mps: Vector3::new(5.0, 2.0, 0.0) },  // near apogee
+        ])
+    }
+
+
     // Linear interpolation between the two nearest altitude bands
     pub fn sample(&self, altitude_m: f64) -> Vector3<f64> {
         if self.bands.is_empty() {
@@ -81,6 +93,18 @@ impl GustModel {
         }
     }
 
+    pub fn default() -> Self {
+        // Gauss-Markov turbulence: sigma is how intense, tau is how "smooth" gusts are.
+        // One-shot peak gust fires at t=5s for 0.5s to stress-test the controller early.
+        Self::new(
+            Vector3::new(0.75, 0.5, 0.15), // sigma [m/s] per axis
+            3.0,                          // tau [s] — 3 seconds is realistic for low-altitude turbulence
+            Vector3::new(2.0, 0.0, 0.0), // peak gust direction + magnitude [m/s]
+            5.0,                          // gust starts at t=5s
+            0.5,                          // gust lasts 0.5s
+        )
+    }
+
     // Steps the gust model and returns stochastic wind velocity [m/s]
     pub fn step(&mut self, dt: f64, system_time: f64) -> Vector3<f64> {
         let mut rng = rng();
@@ -121,6 +145,15 @@ pub struct WindModel {
 impl WindModel {
     pub fn new(profile: WindProfile, gusts: GustModel) -> Self {
         Self { profile, gusts }
+    }
+
+    pub fn default() -> Self {
+        // These are rough placeholder values — replace with site-specific data before flight.
+        let profile = WindProfile::default();
+
+        let gusts = GustModel::default();
+
+        Self::new(profile, gusts)
     }
 
     // Returns total wind velocity [m/s] in world frame at the given altitude.
