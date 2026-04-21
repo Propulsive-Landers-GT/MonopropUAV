@@ -13,8 +13,8 @@ pub struct LosslessSolver {
     pub initial_position: [f64; 3],
     pub initial_velocity: [f64; 3],
     pub glide_slope: f64,
-    pub use_initial_glide_slope: bool,
-    pub use_final_glide_slope: bool,
+    pub use_bottom_glide_slope: bool,
+    pub use_top_glide_slope: bool,
     pub use_terminal_lateral_hard_tube: bool,
     pub terminal_lateral_hard_tube_time_s: f64,
     pub terminal_lateral_hard_tube_radius_m: f64,
@@ -121,8 +121,8 @@ impl Default for LosslessSolver {
             initial_position: [0.0, 0.0, 0.0],
             initial_velocity: [0.0, 0.0, 0.0],
             glide_slope: 0.0,
-            use_initial_glide_slope: false,
-            use_final_glide_slope: false,
+            use_bottom_glide_slope: false,
+            use_top_glide_slope: false,
             use_terminal_lateral_hard_tube: false,
             terminal_lateral_hard_tube_time_s: 0.0,
             terminal_lateral_hard_tube_radius_m: 0.0,
@@ -462,7 +462,7 @@ impl LosslessSolver {
             row_counter += 4;
         }
 
-        if self.use_initial_glide_slope || self.use_final_glide_slope {
+        if self.use_bottom_glide_slope || self.use_top_glide_slope {
             // The glide-slope corridor scales allowable lateral displacement with
             // vertical separation from an anchor point. We use tan(gamma) as the
             // slope parameter, with a floor for numerical safety.
@@ -472,13 +472,24 @@ impl LosslessSolver {
             } else {
                 glide_tan.min(-GLIDE_TAN_FLOOR)
             };
+            let initial_is_bottom = self.initial_position[2] <= self.landing_point[2];
+            let bottom_anchor = if initial_is_bottom {
+                self.initial_position
+            } else {
+                self.landing_point
+            };
+            let top_anchor = if initial_is_bottom {
+                self.landing_point
+            } else {
+                self.initial_position
+            };
+
             for k in 0..=self.N {
                 let x_offset = idx_x + 3 * k;
 
-                if self.use_final_glide_slope {
-                    // Final-endpoint cone:
-                    //   if z_0 >= z_f: ||[x_k - x_f, y_k - y_f]||_2 <= (z_k - z_f) / tan(gamma)
-                    //   else         : ||[x_k - x_f, y_k - y_f]||_2 <= (z_f - z_k) / tan(gamma)
+                if self.use_bottom_glide_slope {
+                    // Bottom-endpoint cone:
+                    //   ||[x_k - x_b, y_k - y_b]||_2 <= (z_k - z_b) / tan(gamma)
                     Self::push_glide_slope_soc(
                         &mut rows,
                         &mut cols,
@@ -487,16 +498,15 @@ impl LosslessSolver {
                         &mut cones,
                         &mut row_counter,
                         x_offset,
-                        self.landing_point,
+                        bottom_anchor,
                         glide_tan_safe,
-                        self.initial_position[2] < self.landing_point[2],
+                        false,
                     );
                 }
 
-                if self.use_initial_glide_slope {
-                    // Initial-endpoint cone:
-                    //   if z_0 >= z_f: ||[x_k - x_0, y_k - y_0]||_2 <= (z_0 - z_k) / tan(gamma)
-                    //   else         : ||[x_k - x_0, y_k - y_0]||_2 <= (z_k - z_0) / tan(gamma)
+                if self.use_top_glide_slope {
+                    // Top-endpoint cone:
+                    //   ||[x_k - x_t, y_k - y_t]||_2 <= (z_t - z_k) / tan(gamma)
                     Self::push_glide_slope_soc(
                         &mut rows,
                         &mut cols,
@@ -505,9 +515,9 @@ impl LosslessSolver {
                         &mut cones,
                         &mut row_counter,
                         x_offset,
-                        self.initial_position,
+                        top_anchor,
                         glide_tan_safe,
-                        self.initial_position[2] >= self.landing_point[2],
+                        true,
                     );
                 }
             }
