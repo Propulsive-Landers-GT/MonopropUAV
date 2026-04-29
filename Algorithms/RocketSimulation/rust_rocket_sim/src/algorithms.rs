@@ -248,6 +248,7 @@ impl LosslessRefreshUpdater {
 pub struct LosslessDebugInfo {
     pub coarse_iterations: u32,
     pub fine_iterations: u32,
+    pub converged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -363,7 +364,7 @@ impl Lossless {
         let terminal_lateral_hard_tube_time_s = 0.0;
         let terminal_lateral_hard_tube_radius_m = 0.0;
         let pointing_direction = [0.0, 0.0, 1.0];
-        let timeout = 3.0;
+        let timeout = 5.0;
         let system_time = -1.0;
         // let update_rate = 3.0;
         let lossless_refresh_updater = LosslessRefreshUpdater::default();
@@ -412,9 +413,11 @@ impl Lossless {
             // rerun mpc, find iterations, run iter_update() on refresh_updater
             let (trajectory, debug_info) = self.solve(current_position, current_velocity, target_position, propellant_mass);
             self.current_traj = self.cached_traj.clone();
-            self.last_solve_time = self.cached_solve_time;
             self.cached_traj = trajectory.clone();
-            self.cached_solve_time = system_time;
+            if debug_info.converged {
+                self.last_solve_time = self.cached_solve_time;
+                self.cached_solve_time = system_time;
+            }
             self.lossless_refresh_updater.reset(debug_info.coarse_iterations as f64, debug_info.fine_iterations as f64, system_time);
             return self.current_traj.clone();
         } else {
@@ -455,6 +458,7 @@ impl Lossless {
         let mut debug_info = LosslessDebugInfo {
             coarse_iterations: 0,
             fine_iterations: 0,
+            converged: result.trajectory.is_some(),
         };
 
         if result.trajectory.is_none() {

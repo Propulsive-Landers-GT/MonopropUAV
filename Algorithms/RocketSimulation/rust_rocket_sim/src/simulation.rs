@@ -186,6 +186,8 @@ impl Simulation {
                 rocket_color = Color::from_rgb(0, 255, 0);
             }
             let rotated_offset = self.rocket.attitude.transform_vector(&self.rocket.com_to_ground);
+            let rocket_forward = self.rocket.attitude.transform_vector(&Vector3::new(1.0, 0.0, 0.0));
+
             let _ = self.rec.as_ref().unwrap().log(
                 "world/rocket",
                 &Arrows3D::from_vectors([((-2.0 * rotated_offset.x) as f32, (-2.0 * rotated_offset.y) as f32, (-2.0 * rotated_offset.z) as f32)])
@@ -201,6 +203,14 @@ impl Simulation {
                     .with_colors([Color::from_rgb(0, 0, 255)]) 
             );
 
+            // Log Forward Vector
+            let _ = self.rec.as_ref().unwrap().log(
+                "world/forward_vector",
+                &Arrows3D::from_vectors([((rocket_forward.x) as f32, (rocket_forward.y) as f32, (rocket_forward.z) as f32)])
+                    .with_origins([[(self.rocket.position.x) as f32, (self.rocket.position.y) as f32, (self.rocket.position.z) as f32]])
+                    .with_colors([Color::from_rgb(255, 165, 0)]) 
+            );
+
             // Log the rocket's position for visualization
             let _ = self.rec.as_ref().unwrap().log(
                 "world/rocket",
@@ -209,7 +219,7 @@ impl Simulation {
                     .with_radii([0.1]) // Size of the point representing the rocket
             );
 
-            // Log the rocket's position for visualization
+            // Log the current simulation time
             let _ = self.rec.as_ref().unwrap().log(
                 "world/timer",
                 &Points3D::new([(self.current_time as f32, 0.0, 0.0)])
@@ -317,7 +327,7 @@ impl Simulation {
 
             // 1. Stage Cost (Q) - Massive penalty for Z errors
             self.mpc.q = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 1000.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
+                150.0, 150.0, 800.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
                 50000.0, 50000.0, 0.0, 0.0,
                 100.0, 100.0, 200.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
                 500.0, 500.0, 500.0   
