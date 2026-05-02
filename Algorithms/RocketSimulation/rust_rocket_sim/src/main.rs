@@ -72,13 +72,15 @@ pub fn export_imu_to_csv(
 fn main() {
     let mut sim = Simulation::default();
     sim.debug = true;
-    // sim.rocket.position = Vector3::new(0.0, 0.0, 49.0);
-    sim.start_state = "ascent".to_string();
+    sim.rocket.position = Vector3::new(0.0, 0.0, 49.0);
+    sim.start_state = "hover".to_string();
     sim.min_time = 3.0;
 
     sim.init();
 
     while sim.step() {}
+
+    sim.finish_sim();
 
     export_imu_to_csv("flight_data.csv", &sim.rocket.debug_info.times, &sim.rocket.debug_info.imu_readings, &sim.rocket.debug_info.attitudes).unwrap();
     

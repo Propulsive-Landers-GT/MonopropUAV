@@ -481,6 +481,8 @@ pub struct RcsController {
     pub dead_theta: f64,
     pub dead_omega: f64,
     pub threshold: f64,
+    pub current_control: RcsCommand,
+    pub cached_control: RcsCommand,
     pub system_time: f64,
     pub refresh_updater: RefreshUpdater,
 }
@@ -500,6 +502,8 @@ impl RcsController {
             dead_theta,
             dead_omega,
             threshold,
+            current_control: RcsCommand { firing_positive: false, firing_negative: false },
+            cached_control: RcsCommand { firing_positive: false, firing_negative: false },
             system_time,
             refresh_updater,
         }
@@ -512,13 +516,26 @@ impl RcsController {
         let dead_omega = 0.08;
         let threshold = 0.8;
         let system_time = 0.0;
-        let refresh_updater = RefreshUpdater::new(0.005, 0.001, 0.00025, 0.00025);
+        let refresh_updater = RefreshUpdater::new(0.1, 0.03, 0.0, 0.0);
 
         Self::new(kp, kd, dead_theta, dead_omega, threshold, system_time, refresh_updater)
     }
 
-    pub fn update(&mut self, roll_angle: f64, roll_rate: f64) -> RcsCommand {
+    pub fn update(&mut self, roll_angle: f64, roll_rate: f64, system_time: f64) -> RcsCommand {
+        if self.refresh_updater.update(system_time) {
+            // rerun mpc, find iterations, run iter_update() on refresh_updater
+            let control_sequence = self.solve(roll_angle, roll_rate);
+            self.current_control = self.cached_control.clone();
+            self.cached_control = control_sequence.clone();
+            self.refresh_updater.reset(0.0, system_time);
+            return self.current_control.clone();
+        } else {
+            // Not time to update yet, return previous control sequence
+            return self.current_control.clone();
+        }
+    }
 
+    pub fn solve(&self, roll_angle: f64, roll_rate: f64) -> RcsCommand {
         if roll_angle.abs() < self.dead_theta && roll_rate.abs() < self.dead_omega {
             return RcsCommand {
                 firing_positive: false,
@@ -535,7 +552,5 @@ impl RcsController {
         } else {
             RcsCommand { firing_positive: false, firing_negative: false }
         }
-
     }
-
 }

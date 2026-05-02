@@ -1,6 +1,7 @@
 use nalgebra::{Vector3, UnitQuaternion};
 use rand::prelude::*;
 use rand_distr::{Normal, Distribution};
+use crate::fluid_dynamics::*;
 
 #[derive(Debug, Clone)]
 pub struct RefreshUpdater {
@@ -447,7 +448,7 @@ impl MTV {
             self.system_time = system_time;
 
             let target_angle = self.get_target_angle(target_thrust);
-            self.angle = target_angle; // TODO: For now, we will assume the MTV can achieve the target angle within one time step. Replace with actual dynamics later.
+            // self.angle = target_angle; // TODO: For now, we will assume the MTV can achieve the target angle within one time step. Replace with actual dynamics later.
 
             let error = target_angle - self.angle;
             let command = error * self.p_gain;
