@@ -1,0 +1,9 @@
+group_name,run_name,fine_clarabel_solve_time_s,set_avg_fine_clarabel_solve_time_s,set_std_error_fine_clarabel_solve_time_s
+cgl_direct_descent_med,cgl_direct_descent_med_1,0.698260,,
+cgl_direct_descent_med,cgl_direct_descent_med_2,0.692199,,
+cgl_direct_descent_med,cgl_direct_descent_med_3,0.701911,,
+cgl_direct_descent_med,set_1_avg,,0.697457,0.002832
+zoh_direct_descent_med,zoh_direct_descent_med_1,0.695433,,
+zoh_direct_descent_med,zoh_direct_descent_med_2,0.710005,,
+zoh_direct_descent_med,zoh_direct_descent_med_3,0.690897,,
+zoh_direct_descent_med,set_1_avg,,0.698778,0.005764

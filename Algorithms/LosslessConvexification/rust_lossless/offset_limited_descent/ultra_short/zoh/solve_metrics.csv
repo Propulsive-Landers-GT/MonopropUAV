@@ -1,0 +1,4 @@
+run_name,pass,attempts,successes,iterations,clarabel_solve_time_s,wall_time_s,last_status,time_of_flight_s
+zoh_offset_limited_descent_ultra_short_1,coarse,2,1,43,1.726442,1.751619,Solved,12.050000
+zoh_offset_limited_descent_ultra_short_1,fine,1,1,25,0.125038,0.134722,Solved,12.000000
+zoh_offset_limited_descent_ultra_short_1,total,3,2,68,1.851480,1.888447,Solved,12.000000

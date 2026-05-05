@@ -156,6 +156,9 @@ impl RocketDebugInfo {
             imu_readings: Vec::new(),
             gps_readings: Vec::new(),
             uwb_readings: Vec::new(),
+            m2_pt_readings: Vec::new(),
+            o_pt_readings: Vec::new(),
+            oa_pt_readings: Vec::new(),
         }
     }
 }

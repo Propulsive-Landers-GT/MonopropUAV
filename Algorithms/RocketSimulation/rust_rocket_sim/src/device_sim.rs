@@ -708,6 +708,8 @@ impl RCS {
     }
 
     pub fn default() -> Self {
+        // TODO: Update these placeholder values with actual RCS hardware data
+        //       once the team has better loadcell calibration numbers.
         let rcs_thrust = 10.0;
         let rcs_lever_arm = 0.15;
         let rcs_nitrogen_consumption_rate = 0.1;
