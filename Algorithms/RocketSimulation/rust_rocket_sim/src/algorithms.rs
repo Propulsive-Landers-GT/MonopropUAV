@@ -248,6 +248,7 @@ impl LosslessRefreshUpdater {
 pub struct LosslessDebugInfo {
     pub coarse_iterations: u32,
     pub fine_iterations: u32,
+    pub converged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -258,11 +259,18 @@ pub struct Lossless {
     pub lower_thrust_bound: f64,
     pub upper_thrust_bound: f64,
     pub tvc_range_rad: f64,
+    pub coarse_line_search_delta_t: f64,
+    pub fine_line_search_delta_t: f64,
     pub coarse_delta_t: f64,
     pub fine_delta_t: f64,
     pub glide_slope: f64,
-    pub use_glide_slope: bool,
-    pub flip_glide_slope: bool,
+    pub use_bottom_glide_slope: bool,
+    pub use_top_glide_slope: bool,
+    pub use_terminal_lateral_hard_tube: bool,
+    pub terminal_lateral_hard_tube_time_s: f64,
+    pub terminal_lateral_hard_tube_radius_m: f64,
+    pub pointing_direction: [f64; 3],
+    pub timeout: f64,
     pub system_time: f64,
     // pub update_rate: f64,
     pub lossless_refresh_updater: LosslessRefreshUpdater,
@@ -273,7 +281,28 @@ pub struct Lossless {
 }
 
 impl Lossless {
-    pub fn new(max_velocity: f64, dry_mass: f64, alpha: f64, lower_thrust_bound: f64, upper_thrust_bound: f64, tvc_range_rad: f64, coarse_delta_t: f64, fine_delta_t: f64, glide_slope: f64, use_glide_slope: bool, flip_glide_slope: bool, pointing_direction: [f64; 3], system_time: f64, lossless_refresh_updater: LosslessRefreshUpdater) -> Self {
+    pub fn new(
+        max_velocity: f64,
+        dry_mass: f64,
+        alpha: f64,
+        lower_thrust_bound: f64,
+        upper_thrust_bound: f64,
+        tvc_range_rad: f64,
+        coarse_line_search_delta_t: f64,
+        fine_line_search_delta_t: f64,
+        coarse_delta_t: f64,
+        fine_delta_t: f64,
+        glide_slope: f64,
+        use_bottom_glide_slope: bool,
+        use_top_glide_slope: bool,
+        use_terminal_lateral_hard_tube: bool,
+        terminal_lateral_hard_tube_time_s: f64,
+        terminal_lateral_hard_tube_radius_m: f64,
+        pointing_direction: [f64; 3],
+        timeout: f64,
+        system_time: f64,
+        lossless_refresh_updater: LosslessRefreshUpdater,
+    ) -> Self {
         Self {
             max_velocity,
             dry_mass,
@@ -281,11 +310,18 @@ impl Lossless {
             lower_thrust_bound,
             upper_thrust_bound,
             tvc_range_rad,
+            coarse_line_search_delta_t,
+            fine_line_search_delta_t,
             coarse_delta_t,
             fine_delta_t,
             glide_slope,
-            use_glide_slope,
-            flip_glide_slope,
+            use_bottom_glide_slope,
+            use_top_glide_slope,
+            use_terminal_lateral_hard_tube,
+            terminal_lateral_hard_tube_time_s,
+            terminal_lateral_hard_tube_radius_m,
+            pointing_direction,
+            timeout,
             system_time,
             // update_rate,
             lossless_refresh_updater,
@@ -317,16 +353,44 @@ impl Lossless {
         let lower_thrust_bound = 400.0;
         let upper_thrust_bound = 900.0;
         let tvc_range_rad = 15_f64.to_radians();
+        let coarse_line_search_delta_t = 0.1;
+        let fine_line_search_delta_t = 0.01;
         let coarse_delta_t = 0.25;
         let fine_delta_t = 0.1;
         let glide_slope = 0.05_f64.to_radians();
-        let use_glide_slope = true;
-        let flip_glide_slope = true;
+        let use_bottom_glide_slope = true;
+        let use_top_glide_slope = true;
+        let use_terminal_lateral_hard_tube = false;
+        let terminal_lateral_hard_tube_time_s = 0.0;
+        let terminal_lateral_hard_tube_radius_m = 0.0;
+        let pointing_direction = [0.0, 0.0, 1.0];
+        let timeout = 5.0;
         let system_time = -1.0;
         // let update_rate = 3.0;
         let lossless_refresh_updater = LosslessRefreshUpdater::default();
 
-        Self::new(max_velocity, dry_mass, alpha, lower_thrust_bound, upper_thrust_bound, tvc_range_rad, coarse_delta_t, fine_delta_t, glide_slope, use_glide_slope, flip_glide_slope, [0.0; 3], system_time, lossless_refresh_updater)
+        Self::new(
+            max_velocity,
+            dry_mass,
+            alpha,
+            lower_thrust_bound,
+            upper_thrust_bound,
+            tvc_range_rad,
+            coarse_line_search_delta_t,
+            fine_line_search_delta_t,
+            coarse_delta_t,
+            fine_delta_t,
+            glide_slope,
+            use_bottom_glide_slope,
+            use_top_glide_slope,
+            use_terminal_lateral_hard_tube,
+            terminal_lateral_hard_tube_time_s,
+            terminal_lateral_hard_tube_radius_m,
+            pointing_direction,
+            timeout,
+            system_time,
+            lossless_refresh_updater,
+        )
     }
 
     pub fn update(&mut self, current_position: [f64; 3], current_velocity: [f64; 3], target_position: [f64; 3], propellant_mass: f64, system_time: f64) -> TrajectoryResult {
@@ -349,9 +413,11 @@ impl Lossless {
             // rerun mpc, find iterations, run iter_update() on refresh_updater
             let (trajectory, debug_info) = self.solve(current_position, current_velocity, target_position, propellant_mass);
             self.current_traj = self.cached_traj.clone();
-            self.last_solve_time = self.cached_solve_time;
             self.cached_traj = trajectory.clone();
-            self.cached_solve_time = system_time;
+            if debug_info.converged {
+                self.last_solve_time = self.cached_solve_time;
+                self.cached_solve_time = system_time;
+            }
             self.lossless_refresh_updater.reset(debug_info.coarse_iterations as f64, debug_info.fine_iterations as f64, system_time);
             return self.current_traj.clone();
         } else {
@@ -372,10 +438,18 @@ impl Lossless {
             lower_thrust_bound: self.lower_thrust_bound,
             upper_thrust_bound: self.upper_thrust_bound,
             tvc_range_rad: self.tvc_range_rad,
+            coarse_line_search_delta_t: self.coarse_line_search_delta_t,
+            fine_line_search_delta_t: self.fine_line_search_delta_t,
             coarse_delta_t: self.coarse_delta_t,
             fine_delta_t: self.fine_delta_t,
-            use_glide_slope: self.use_glide_slope,
             glide_slope: self.glide_slope,
+            use_bottom_glide_slope: self.use_bottom_glide_slope,
+            use_top_glide_slope: self.use_top_glide_slope,
+            use_terminal_lateral_hard_tube: self.use_terminal_lateral_hard_tube,
+            terminal_lateral_hard_tube_time_s: self.terminal_lateral_hard_tube_time_s,
+            terminal_lateral_hard_tube_radius_m: self.terminal_lateral_hard_tube_radius_m,
+            pointing_direction: self.pointing_direction,
+            timeout: self.timeout,
             N: 20, // will be overridden by the solver based on the problem setup
             ..Default::default()
         };
@@ -384,6 +458,7 @@ impl Lossless {
         let mut debug_info = LosslessDebugInfo {
             coarse_iterations: 0,
             fine_iterations: 0,
+            converged: result.trajectory.is_some(),
         };
 
         if result.trajectory.is_none() {
@@ -406,6 +481,8 @@ pub struct RcsController {
     pub dead_theta: f64,
     pub dead_omega: f64,
     pub threshold: f64,
+    pub current_control: RcsCommand,
+    pub cached_control: RcsCommand,
     pub system_time: f64,
     pub refresh_updater: RefreshUpdater,
 }
@@ -425,6 +502,8 @@ impl RcsController {
             dead_theta,
             dead_omega,
             threshold,
+            current_control: RcsCommand { firing_positive: false, firing_negative: false },
+            cached_control: RcsCommand { firing_positive: false, firing_negative: false },
             system_time,
             refresh_updater,
         }
@@ -437,13 +516,26 @@ impl RcsController {
         let dead_omega = 0.08;
         let threshold = 0.8;
         let system_time = 0.0;
-        let refresh_updater = RefreshUpdater::new(0.005, 0.001, 0.00025, 0.00025);
+        let refresh_updater = RefreshUpdater::new(0.1, 0.03, 0.0, 0.0);
 
         Self::new(kp, kd, dead_theta, dead_omega, threshold, system_time, refresh_updater)
     }
 
-    pub fn update(&mut self, roll_angle: f64, roll_rate: f64) -> RcsCommand {
+    pub fn update(&mut self, roll_angle: f64, roll_rate: f64, system_time: f64) -> RcsCommand {
+        if self.refresh_updater.update(system_time) {
+            // rerun mpc, find iterations, run iter_update() on refresh_updater
+            let control_sequence = self.solve(roll_angle, roll_rate);
+            self.current_control = self.cached_control.clone();
+            self.cached_control = control_sequence.clone();
+            self.refresh_updater.reset(0.0, system_time);
+            return self.current_control.clone();
+        } else {
+            // Not time to update yet, return previous control sequence
+            return self.current_control.clone();
+        }
+    }
 
+    pub fn solve(&self, roll_angle: f64, roll_rate: f64) -> RcsCommand {
         if roll_angle.abs() < self.dead_theta && roll_rate.abs() < self.dead_omega {
             return RcsCommand {
                 firing_positive: false,
@@ -460,7 +552,5 @@ impl RcsController {
         } else {
             RcsCommand { firing_positive: false, firing_negative: false }
         }
-
     }
-
 }

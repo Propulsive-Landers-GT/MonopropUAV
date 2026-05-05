@@ -24,8 +24,7 @@ from scipy.optimize import minimize, differential_evolution
 # ---------------------------------------------------------------------------
 # Load the engine module by path (its filename contains spaces).
 # ---------------------------------------------------------------------------
-_ENGINE_PATH = Path(__file__).parent / "Dynamic Mdot PID.py"
-_spec   = importlib.util.spec_from_file_location("dynamic_mdot_pid", _ENGINE_PATH)
+_spec   = importlib.util.spec_from_file_location("dynamic_mdot_pid", "./dynamic_pid.py")
 _engine = importlib.util.module_from_spec(_spec)
 sys.modules["dynamic_mdot_pid"] = _engine
 _spec.loader.exec_module(_engine)

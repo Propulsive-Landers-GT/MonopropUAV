@@ -14,6 +14,7 @@ pub struct Simulation {
     pub rocket: Rocket,
     pub mpc: MPC,
     pub lossless: Lossless,
+    pub rcs_controller: RcsController,
     pub debug: bool,
     pub dt: f64,
     pub current_time: f64,
@@ -33,6 +34,7 @@ impl Default for Simulation {
             rocket: Rocket::default(),
             mpc: MPC::default(),
             lossless: Lossless::default(),
+            rcs_controller: RcsController::default(),
             dt: 0.01,
             current_time: 0.0,
             debug: false,
@@ -49,11 +51,12 @@ impl Default for Simulation {
 }
 
 impl Simulation {
-    pub fn new(rocket: Rocket, mpc: MPC, lossless: Lossless, dt: f64, current_time: f64, debug: bool, has_exceeded_angle: bool, min_time: f64, traj_stage: i32, traj_timer: f64, start_state: String, end_state: String) -> Self {
+    pub fn new(rocket: Rocket, mpc: MPC, lossless: Lossless, rcs_controller: RcsController, dt: f64, current_time: f64, debug: bool, has_exceeded_angle: bool, min_time: f64, traj_stage: i32, traj_timer: f64, start_state: String, end_state: String) -> Self {
         let mut simulation = Self {
             rocket,
             mpc,
             lossless,
+            rcs_controller,
             dt,
             current_time,
             debug,
@@ -118,6 +121,9 @@ impl Simulation {
         self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 50.0], self.rocket.get_mass() - self.rocket.get_dry_mass(), -10.0);
 
         self.mpc.update(&self.rocket.get_state(), &vec![Array1::zeros(13); self.mpc.n_steps + 1], &vec![Array1::zeros(3); self.mpc.n_steps], self.rocket.get_mass(), &self.rocket.get_moi_mpc(), -10.0);
+        
+        let (_, _, yaw) = self.rocket.attitude.euler_angles();
+        self.rcs_controller.update(yaw, self.rocket.ang_vel.z, -10.0);
     }
 
     pub fn step(&mut self) -> bool {
@@ -162,8 +168,21 @@ impl Simulation {
         // 3. Interpolate! 
         // Because u_0 and u_1 are ndarray::Array1<f64>, Rust lets you do the vector math directly.
         let current_control = u_0 + progress * (u_1 - u_0);
+        
+        let (_, _, yaw) = self.rocket.attitude.euler_angles();
+        let rcs_command = self.rcs_controller.update(yaw, self.rocket.ang_vel.z, self.current_time);
+        let translated_rcs_command;
+        if rcs_command.firing_positive && rcs_command.firing_negative {
+            translated_rcs_command = 0.0;
+        } else if rcs_command.firing_positive {
+            translated_rcs_command = -1.0; // Example: positive firing adds to the control input
+        } else if rcs_command.firing_negative {
+            translated_rcs_command = 1.0; // Example: negative firing subtracts from the control input
+        } else {
+            translated_rcs_command = 0.0;
+        }
 
-        let control_input = Vector4::new(current_control[0], current_control[1], current_control[2], 0.0); // Convert first control input to Vector4 (assuming the 4th component is not used for now)
+        let control_input = Vector4::new(current_control[0], current_control[1], current_control[2], translated_rcs_command); // Convert first control input to Vector4 (assuming the 4th component is not used for now)
 
         if !self.rocket.step(control_input, outside_forces, outside_torques, self.dt) && self.current_time > self.min_time {
             return false;
@@ -186,6 +205,8 @@ impl Simulation {
                 rocket_color = Color::from_rgb(0, 255, 0);
             }
             let rotated_offset = self.rocket.attitude.transform_vector(&self.rocket.com_to_ground);
+            let rocket_forward = self.rocket.attitude.transform_vector(&Vector3::new(1.0, 0.0, 0.0));
+
             let _ = self.rec.as_ref().unwrap().log(
                 "world/rocket",
                 &Arrows3D::from_vectors([((-2.0 * rotated_offset.x) as f32, (-2.0 * rotated_offset.y) as f32, (-2.0 * rotated_offset.z) as f32)])
@@ -201,6 +222,14 @@ impl Simulation {
                     .with_colors([Color::from_rgb(0, 0, 255)]) 
             );
 
+            // Log Forward Vector
+            let _ = self.rec.as_ref().unwrap().log(
+                "world/forward_vector",
+                &Arrows3D::from_vectors([((rocket_forward.x) as f32, (rocket_forward.y) as f32, (rocket_forward.z) as f32)])
+                    .with_origins([[(self.rocket.position.x) as f32, (self.rocket.position.y) as f32, (self.rocket.position.z) as f32]])
+                    .with_colors([Color::from_rgb(255, 165, 0)]) 
+            );
+
             // Log the rocket's position for visualization
             let _ = self.rec.as_ref().unwrap().log(
                 "world/rocket",
@@ -209,7 +238,7 @@ impl Simulation {
                     .with_radii([0.1]) // Size of the point representing the rocket
             );
 
-            // Log the rocket's position for visualization
+            // Log the current simulation time
             let _ = self.rec.as_ref().unwrap().log(
                 "world/timer",
                 &Points3D::new([(self.current_time as f32, 0.0, 0.0)])
@@ -308,6 +337,7 @@ impl Simulation {
                                                 self.mpc.n_steps + 1];
             uref_traj = vec![Array1::from(vec![0.0, 0.0, self.rocket.get_mass() * 9.81]); self.mpc.n_steps]; // Warm start with zero control inputs
             self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [0.0, 0.0, 0.0], [0.0, 0.0, 1.5], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
+            self.lossless.last_solve_time = self.current_time;
             if self.current_time - self.traj_timer >= 10.0 {
                 self.traj_stage = 2;
                 self.traj_timer = self.current_time;
@@ -317,9 +347,9 @@ impl Simulation {
 
             // 1. Stage Cost (Q) - Massive penalty for Z errors
             self.mpc.q = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 1000.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
-                50000.0, 50000.0, 0.0, 0.0,
-                100.0, 100.0, 200.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
+                150.0, 150.0, 800.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
+                70000.0, 70000.0, 0.0, 0.0,
+                100.0, 100.0, 2000.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
                 500.0, 500.0, 500.0   
             ]));
 
@@ -330,19 +360,21 @@ impl Simulation {
             // 3. Terminal Cost (QN) - Land softly!
             self.mpc.qn = Array2::<f64>::from_diag(&Array1::from(vec![
                 150.0, 150.0, 3000.0, 
-                50000.0, 50000.0, 0.0, 0.0,
-                100.0, 100.0, 500.0, 
+                100000.0, 100000.0, 0.0, 0.0,
+                100.0, 100.0, 1000.0, 
                 1000.0, 1000.0, 1000.0 
             ]));
-            self.lossless.lower_thrust_bound = 400.0;
-            self.lossless.flip_glide_slope = false;
-            self.lossless.use_glide_slope = true;
+            self.lossless.lower_thrust_bound = 500.0;
+            // self.lossless.flip_glide_slope = false;
+            // self.lossless.use_glide_slope = true;
+            self.lossless.use_bottom_glide_slope = true;
+            self.lossless.use_top_glide_slope = true;
             self.lossless.glide_slope = 0.005_f64.to_radians();
             // self.lossless.max_velocity = 5.0;
             // if self.rocket.velocity.norm() >= 5.0 {
             //     self.lossless.max_velocity = self.rocket.velocity.norm() * 1.25;
             // }
-            let trajectory = self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 1.5], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
+            let trajectory = self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 1.5-1.5], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
             (xref_traj, uref_traj) = self.get_mpc_reference(&trajectory, self.current_time - self.lossless.last_solve_time, self.rocket.attitude, self.mpc.min_thrust, self.mpc.dt, self.lossless.fine_delta_t, self.mpc.n_steps + 1);
             if self.current_time - self.traj_timer > 30.0 {
                 self.traj_stage = -1;
