@@ -1,0 +1,4 @@
+run_name,pass,attempts,successes,iterations,clarabel_solve_time_s,wall_time_s,last_status,time_of_flight_s
+cgl_offset_descent_ultra_short_1,coarse,0,0,0,0.000000,0.000000,Unsolved,
+cgl_offset_descent_ultra_short_1,fine,1,1,19,0.115989,0.125229,Solved,7.300000
+cgl_offset_descent_ultra_short_1,total,1,1,19,0.115989,3.178389,Solved,7.300000

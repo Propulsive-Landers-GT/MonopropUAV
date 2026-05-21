@@ -52,11 +52,24 @@ pub struct Rocket {
 
     pub rcs: RCS,
 
+    // Propellant Feed System Valves
+    pub fill_mv: Valve,  // Fill valve (entry to lander tanks — irrelevant in flight)
+    pub r_mv: Valve,     // Regulator isolation valve (N2 storage → N2O run tank)
+    pub rcs1_mv: Valve,  // RCS thruster pair 1 (controls one roll direction)
+    pub rcs2_mv: Valve,  // RCS thruster pair 2 (controls opposite roll direction)
+    pub o_iso: Valve,    // Oxidizer isolation valve (N2O run tank → MTV/engine)
+    pub o_vnt: Valve,    // Oxidizer vent valve (relieves run tank pressure)
+
     pub thrust_vector: Vector3<f64>,
 
     pub imu: IMU,
     pub gps: GPS,
     pub uwb: UWB,
+
+    // Pressure Transducers
+    pub m2_pt: PressureTransducer,  // After MTV, before check valve
+    pub o_pt: PressureTransducer,   // After N2O run tank, before vent
+    pub oa_pt: PressureTransducer,  // Before N2O run tank, after r_mv
 
     pub sloshing_model: SloshModel,
 
@@ -109,6 +122,9 @@ pub struct RocketDebugInfo{
     pub imu_readings: Vec<IMUReading>,
     pub gps_readings: Vec<GPSReading>,
     pub uwb_readings: Vec<UWBReading>,
+    pub m2_pt_readings: Vec<PTReading>,
+    pub o_pt_readings: Vec<PTReading>,
+    pub oa_pt_readings: Vec<PTReading>,
 }
 
 impl RocketDebugInfo {
@@ -140,12 +156,15 @@ impl RocketDebugInfo {
             imu_readings: Vec::new(),
             gps_readings: Vec::new(),
             uwb_readings: Vec::new(),
+            m2_pt_readings: Vec::new(),
+            o_pt_readings: Vec::new(),
+            oa_pt_readings: Vec::new(),
         }
     }
 }
 
 impl Rocket {
-    pub fn new(position: Vector3<f64>, velocity: Vector3<f64>, accel: Vector3<f64>, attitude: UnitQuaternion<f64>, ang_vel: Vector3<f64>, ang_accel: Vector3<f64>, frame_mass: f64, nitrogen_tank_empty_mass: f64, starting_nitrogen_mass: f64, nitrogen_tank_offset: Vector3<f64>, nitrous_tank_empty_mass: f64, starting_pressurizing_nitrogen_mass: f64, starting_nitrous_mass: f64, nitrous_tank_offset: Vector3<f64>, tvc_module_empty_mass: f64, starting_fuel_grain_mass: f64, frame_com_to_gimbal: Vector3<f64>, gimbal_to_tvc_com: Vector3<f64>, frame_moi: Matrix3<f64>, dry_nitrogen_moi: Matrix3<f64>, wet_nitrogen_moi: Matrix3<f64>, nitrous_tank_radius: f64, nitrous_tank_length: f64, nitrous_level: f64, dry_nitrous_moi: Matrix3<f64>, dry_tvc_moi: Matrix3<f64>, wet_tvc_moi: Matrix3<f64>, tvc_range: f64, tvc: TVC, rcs: RCS, imu: IMU, gps: GPS, uwb: UWB, sloshing_model: SloshModel, thermo_fluid_solver: ThermoFluidSolver, com_to_ground: Vector3<f64>, wind_model: Option<WindModel>, aero_table: Option<AeroTable>, nose_offset: Vector3<f64>) -> Self {
+    pub fn new(position: Vector3<f64>, velocity: Vector3<f64>, accel: Vector3<f64>, attitude: UnitQuaternion<f64>, ang_vel: Vector3<f64>, ang_accel: Vector3<f64>, frame_mass: f64, nitrogen_tank_empty_mass: f64, starting_nitrogen_mass: f64, nitrogen_tank_offset: Vector3<f64>, nitrous_tank_empty_mass: f64, starting_pressurizing_nitrogen_mass: f64, starting_nitrous_mass: f64, nitrous_tank_offset: Vector3<f64>, tvc_module_empty_mass: f64, starting_fuel_grain_mass: f64, frame_com_to_gimbal: Vector3<f64>, gimbal_to_tvc_com: Vector3<f64>, frame_moi: Matrix3<f64>, dry_nitrogen_moi: Matrix3<f64>, wet_nitrogen_moi: Matrix3<f64>, nitrous_tank_radius: f64, nitrous_tank_length: f64, nitrous_level: f64, dry_nitrous_moi: Matrix3<f64>, dry_tvc_moi: Matrix3<f64>, wet_tvc_moi: Matrix3<f64>, tvc_range: f64, tvc: TVC, rcs: RCS, fill_mv: Valve, r_mv: Valve, rcs1_mv: Valve, rcs2_mv: Valve, o_iso: Valve, o_vnt: Valve, imu: IMU, gps: GPS, uwb: UWB, m2_pt: PressureTransducer, o_pt: PressureTransducer, oa_pt: PressureTransducer, sloshing_model: SloshModel, thermo_fluid_solver: ThermoFluidSolver, com_to_ground: Vector3<f64>, wind_model: Option<WindModel>, aero_table: Option<AeroTable>, nose_offset: Vector3<f64>) -> Self {
         let mut rocket = Self {
             position,
             velocity,
@@ -182,10 +201,19 @@ impl Rocket {
             tvc_range,
             tvc,
             rcs,
+            fill_mv,
+            r_mv,
+            rcs1_mv,
+            rcs2_mv,
+            o_iso,
+            o_vnt,
             thrust_vector: Vector3::zeros(),
             imu,
             gps,
             uwb,
+            m2_pt,
+            o_pt,
+            oa_pt,
             sloshing_model,
             thermo_fluid_solver,
             nitrous_m_dot: 0.0,
@@ -194,7 +222,37 @@ impl Rocket {
             aero_table,
             nose_offset,
             system_time: 0.0,
-            debug_info: RocketDebugInfo::default(),
+            debug_info: RocketDebugInfo {
+                thrust_torque: Vector3::zeros(),
+                total_force: Vector3::zeros(),
+                total_torque: Vector3::zeros(),
+                times: Vec::new(),
+                com_offsets: Vec::new(),
+                mois: Vec::new(),
+                thrusts: Vec::new(),
+                slosh_forces: Vec::new(),
+                nitrous_m_dots: Vec::new(),
+                valve_angles: Vec::new(),
+                chamber_pressures: Vec::new(),
+                of_ratios: Vec::new(),
+                isps: Vec::new(),
+                cstars: Vec::new(),
+                port_ds: Vec::new(),
+                fuel_masses: Vec::new(),
+                nitrous_masses: Vec::new(),
+                nitrogen_n2_tank_masses: Vec::new(),
+                nitrogen_n2o_tank_masses: Vec::new(),
+                wind_vels: Vec::new(),
+                aero_drags: Vec::new(),
+                aero_moments: Vec::new(),
+                attitudes: Vec::new(),
+                imu_readings: Vec::new(),
+                gps_readings: Vec::new(),
+                uwb_readings: Vec::new(),
+                m2_pt_readings: Vec::new(),
+                o_pt_readings: Vec::new(),
+                oa_pt_readings: Vec::new(),
+            },
         };
 
         rocket.imu.update(rocket.accel, rocket.ang_vel, rocket.attitude, rocket.system_time);
@@ -262,6 +320,19 @@ impl Rocket {
 
         let uwb = UWB::default();
 
+        // Pressure Transducers
+        let m2_pt = PressureTransducer::default_with_label("m2-pt");
+        let o_pt = PressureTransducer::default_with_label("o-pt");
+        let oa_pt = PressureTransducer::default_with_label("oa-pt");
+
+        // Propellant Feed System Valves — default operational states for flight
+        let fill_mv = Valve::new(false);   // Closed in flight (only used during ground fill)
+        let r_mv = Valve::new(true);       // Open: allows N2 to pressurize the N2O tank
+        let rcs1_mv = Valve::new(false);   // Closed by default: responsive to roll commands
+        let rcs2_mv = Valve::new(false);   // Closed by default: responsive to roll commands
+        let o_iso = Valve::new(true);      // Open: allows N2O to flow to engine
+        let o_vnt = Valve::new(false);     // Closed: only opens to relieve excess pressure
+
         let slosh_model = SloshModel::default();
         let thermo_fluid_solver = ThermoFluidSolver::default();
 
@@ -274,8 +345,7 @@ impl Rocket {
 
         let nose_offset = Vector3::new(0.0, 0.0, 1.5); // TODO: change this to a proper value once frame is re-cadded
 
-
-        Self::new(position, velocity, acceleration, attitude, angular_velocity, angular_acceleration, frame_mass, nitrogen_tank_empty_mass, starting_nitrogen_mass, nitrogen_tank_offset, nitrous_tank_empty_mass, starting_pressurizing_nitrogen_mass, starting_nitrous_mass, nitrous_tank_offset, tvc_module_empty_mass, starting_fuel_grain_mass, frame_com_to_gimbal, gimbal_to_tvc_com, frame_moi, dry_nitrogen_moi, wet_nitrogen_moi, nitrous_tank_radius, nitrous_tank_length, nitrous_level, dry_nitrous_moi, dry_tvc_moi, wet_tvc_moi, tvc_range, tvc, rcs, imu, gps, uwb, slosh_model, thermo_fluid_solver, com_to_ground, wind_model, aero_table, nose_offset)
+        Self::new(position, velocity, acceleration, attitude, angular_velocity, angular_acceleration, frame_mass, nitrogen_tank_empty_mass, starting_nitrogen_mass, nitrogen_tank_offset, nitrous_tank_empty_mass, starting_pressurizing_nitrogen_mass, starting_nitrous_mass, nitrous_tank_offset, tvc_module_empty_mass, starting_fuel_grain_mass, frame_com_to_gimbal, gimbal_to_tvc_com, frame_moi, dry_nitrogen_moi, wet_nitrogen_moi, nitrous_tank_radius, nitrous_tank_length, nitrous_level, dry_nitrous_moi, dry_tvc_moi, wet_tvc_moi, tvc_range, tvc, rcs, fill_mv, r_mv, rcs1_mv, rcs2_mv, o_iso, o_vnt, imu, gps, uwb, m2_pt, o_pt, oa_pt, slosh_model, thermo_fluid_solver, com_to_ground, wind_model, aero_table, nose_offset)
     }
 
     /// Update state based on applied forces and torques
@@ -325,19 +395,35 @@ impl Rocket {
         self.fuel_grain_mass = tvc_effect.fuel_grain_mass;
 
         // TODO: implement throttle controller
-        // TODO: talk to team and change the control vector to have 4 dimensions (add in rcs control command)
-        let rcs_command = control_input.w; // Assuming the 4th element of control_input is for RCS
-        let rcs_effect = self.rcs.update(rcs_command, self.nitrogen_mass, dt, self.system_time);
+        // TODO: Consider expanding control_input to drive valve commands from GNC algorithms.
+        //       For now, RCS valves are toggled based on the sign of the roll command.
+        let rcs_command = control_input.w; // 4th element is the roll command
+        // Map the scalar roll command to individual valve states:
+        //   positive → rcs1_mv opens (clockwise roll)
+        //   negative → rcs2_mv opens (counter-clockwise roll)
+        //   zero     → both closed
+        let rcs1_open = self.rcs1_mv.is_open || rcs_command > 0.0;
+        let rcs2_open = self.rcs2_mv.is_open || rcs_command < 0.0;
+        let rcs_effect = self.rcs.update(rcs1_open, rcs2_open, self.nitrogen_mass, dt, self.system_time);
         self.nitrogen_mass = rcs_effect.nitrogen_mass;
 
         
-        // Fluid dynamics update
+        // Fluid dynamics update — pass valve states to control flow paths
         let thrust_command = control_input[2];
-        let is_rcs_on = control_input[3] != 0.0;
         let n2o_mass = self.nitrous_mass;
+        let n2_mass_runtank = self.pressurizing_nitrogen_mass;
         let n2_mass_total = self.nitrogen_mass + self.pressurizing_nitrogen_mass;
         let fluid_dynamics_dt = dt;
-        let fluid_dynamics_output = self.thermo_fluid_solver.fluid_dynamics_update(thrust_command, is_rcs_on, n2o_mass, n2_mass_total, fluid_dynamics_dt);
+        let fluid_dynamics_output = self.thermo_fluid_solver.fluid_dynamics_update(
+            thrust_command,
+            self.o_iso.is_open,
+            self.r_mv.is_open,
+            self.o_vnt.is_open,
+            n2o_mass,
+            n2_mass_runtank,
+            n2_mass_total,
+            fluid_dynamics_dt,
+        );
 
         self.fuel_grain_mass = fluid_dynamics_output.new_fuel_mass;
         self.nitrous_mass = fluid_dynamics_output.new_n2o_mass;
@@ -359,6 +445,14 @@ impl Rocket {
         self.debug_info.nitrous_masses.push(self.nitrous_mass);
         self.debug_info.nitrogen_n2_tank_masses.push(self.nitrogen_mass);
         self.debug_info.nitrogen_n2o_tank_masses.push(self.pressurizing_nitrogen_mass);
+
+        // Update Pressure Transducers with true pressures from the fluid solver
+        let m2_pt_reading = self.m2_pt.update(fluid_dynamics_output.p_downstream_mtv_bar, self.system_time);
+        let o_pt_reading = self.o_pt.update(fluid_dynamics_output.p_runtank_bar, self.system_time);
+        let oa_pt_reading = self.oa_pt.update(fluid_dynamics_output.p_upstream_runtank_bar, self.system_time);
+        self.debug_info.m2_pt_readings.push(m2_pt_reading);
+        self.debug_info.o_pt_readings.push(o_pt_reading);
+        self.debug_info.oa_pt_readings.push(oa_pt_reading);
 
 
         self.system_time += dt;
@@ -661,7 +755,9 @@ impl Rocket {
             // Aero Drag [N], body frame
             "aero_drag_x", "aero_drag_y", "aero_drag_z",
             // Aero Moment [N*m], body frame
-            "aero_moment_x", "aero_moment_y", "aero_moment_z"
+            "aero_moment_x", "aero_moment_y", "aero_moment_z",
+            // Pressure Transducer readings [bar]
+            "m2_pt_bar", "o_pt_bar", "oa_pt_bar"
         ])?;
 
         let num_records = self.debug_info.times.len();
@@ -714,6 +810,9 @@ impl Rocket {
                 aero_moment.x.to_string(),
                 aero_moment.y.to_string(),
                 aero_moment.z.to_string(),
+                self.debug_info.m2_pt_readings[i].pressure_bar.to_string(),
+                self.debug_info.o_pt_readings[i].pressure_bar.to_string(),
+                self.debug_info.oa_pt_readings[i].pressure_bar.to_string(),
             ])?;
         }
 

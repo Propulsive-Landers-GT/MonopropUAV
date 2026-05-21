@@ -39,6 +39,17 @@ pub struct FluidDynamicsOutput {
     pub isp_realized: f64,
     pub cstar_realized: f64,
     pub pc_bar: f64,
+
+    // --- Pressure transducer tap points ---
+    // TODO: p_downstream_mtv_bar currently aliases pc_bar (chamber pressure).
+    //       Once the check valve is modeled, this should account for the
+    //       pressure drop across the check valve between the MTV and engine.
+    /// Pressure downstream of the MTV, before the check valve [bar]
+    pub p_downstream_mtv_bar: f64,
+    /// N2O run tank pressure (N2 ullage via ideal gas law) [bar]
+    pub p_runtank_bar: f64,
+    /// Pressure upstream of the run tank, downstream of r_mv [bar]
+    pub p_upstream_runtank_bar: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +78,13 @@ pub struct ThermoFluidParameters {
     pub tank_d: f64,
     pub temp: f64,
     pub n2_mass_flowrate_rcs: f64,
+
+    /// Volume of the plumbing line segment between r_mv and the run tank [m³].
+    /// When r_mv closes, nitrogen is trapped in this volume and its pressure
+    /// decays as it slowly equalises with the run tank via leakage/diffusion.
+    /// This is a placeholder value — refine with actual CAD measurements of
+    /// the line length and inner diameter.
+    pub line_vol_r_mv: f64,
 }
 
 impl ThermoFluidParameters {
@@ -96,6 +114,7 @@ impl ThermoFluidParameters {
             tank_d: 0.254,
             temp: 301.15,
             n2_mass_flowrate_rcs: 0.0085 * 2.0,
+            line_vol_r_mv: 0.001,  // ~1 litre placeholder — refine with CAD
         }
     }
 }
@@ -103,19 +122,32 @@ impl ThermoFluidParameters {
 #[derive(Debug, Clone)]
 pub struct ThermoFluidSolver {
     pub parameters: ThermoFluidParameters,
+
+    /// Tracked mass of nitrogen trapped in the line between r_mv and the
+    /// run tank [kg].  When r_mv is open this is kept at the set-point
+    /// density × line volume.  When r_mv closes, no more nitrogen enters
+    /// and this mass is held constant while the trapped pressure decays
+    /// via the ideal gas law as the line slowly equalises with the tank.
+    pub n2_mass_line: f64,
 }
 
 impl ThermoFluidSolver {
     pub fn new(parameters: ThermoFluidParameters) -> Self {
+        // Initialise the trapped line mass at the regulated set-point pressure.
+        // P = m * R * T / V  =>  m = P * V / (R * T)
+        let r_specific_n2 = 296.8; // J/(kg·K)
+        let p_set_pa = parameters.p1_mpa * 1e6;
+        let n2_mass_line = (p_set_pa * parameters.line_vol_r_mv)
+            / (r_specific_n2 * parameters.temp);
         Self {
             parameters,
+            n2_mass_line,
         }
     }
 
     pub fn default() -> Self {
-        Self {
-            parameters: ThermoFluidParameters::default(),
-        }
+        let params = ThermoFluidParameters::default();
+        Self::new(params)
     }
 
     pub fn flowrate_solver(
@@ -396,8 +428,11 @@ impl ThermoFluidSolver {
     pub fn fluid_dynamics_update(
         &mut self,
         thrust_commanded: f64,
-        is_rcs_on: bool,
+        o_iso_open: bool,
+        r_mv_open: bool,
+        o_vnt_open: bool,
         n2o_mass: f64,
+        n2_mass_runtank: f64,
         n2_mass_total: f64,
         dt: f64,
     ) -> FluidDynamicsOutput {
@@ -407,45 +442,157 @@ impl ThermoFluidSolver {
         let rho_n2 = Self::interp1(&self.parameters.nitrogen_iso.t_iso, &self.parameters.nitrogen_iso.rho_iso, self.parameters.temp);
         
         // 1. Calculate the required mass flow rate and resulting change in fuel grain
-        let fr_sol = match self.flowrate_solver(thrust_commanded, dt) {
-            Some(sol) => sol,
-            None => FlowrateSolution {
-                    thrust_realized: 0.0,
-                    new_port_d: self.parameters.port_d,
-                    fuel_mass: 0.0,
-                    mdot_ox: 0.0,
-                    pc_bar: 0.0,
-                    of_ratio_realized: 0.0,
-                    isp_realized: 0.0,
-                    cstar_realized: 0.0,
-            },
+        //    o_iso must be open for oxidizer to flow to the engine
+        let fr_sol = if o_iso_open {
+            match self.flowrate_solver(thrust_commanded, dt) {
+                Some(sol) => sol,
+                None => FlowrateSolution {
+                        thrust_realized: 0.0,
+                        new_port_d: self.parameters.port_d,
+                        fuel_mass: 0.0,
+                        mdot_ox: 0.0,
+                        pc_bar: 0.0,
+                        of_ratio_realized: 0.0,
+                        isp_realized: 0.0,
+                        cstar_realized: 0.0,
+                },
+            }
+        } else {
+            // o_iso is closed — no oxidizer flows, no thrust
+            FlowrateSolution {
+                thrust_realized: 0.0,
+                new_port_d: self.parameters.port_d,
+                fuel_mass: 0.0,
+                mdot_ox: 0.0,
+                pc_bar: 0.0,
+                of_ratio_realized: 0.0,
+                isp_realized: 0.0,
+                cstar_realized: 0.0,
+            }
         };
         
         // 2. Safely calculate the MTV angle with a Wide-Open-Throttle failsafe
-        let ang_sol = match self.angle_solver(fr_sol.mdot_ox, fr_sol.pc_bar) {
-            Ok(sol) => sol,
-            Err(_) => AngleSolution {
+        let ang_sol = if o_iso_open && fr_sol.mdot_ox > 0.0 {
+            match self.angle_solver(fr_sol.mdot_ox, fr_sol.pc_bar) {
+                Ok(sol) => sol,
+                Err(_) => AngleSolution {
+                    theta_deg: 0.0,
+                    a_ev: 0.0,
+                },
+            }
+        } else {
+            AngleSolution {
                 theta_deg: 0.0,
                 a_ev: 0.0,
-            },
+            }
         };
 
-        // 3. Mass tracking
+        // 3. Mass tracking — oxidizer consumed
         let new_n2o_mass = n2o_mass - fr_sol.mdot_ox * dt;
         
-        // 4. Calculate Nitrogen mass
-        let new_n2_mass_runtank = (self.parameters.runtank_vol - new_n2o_mass * (1.0 / rho_n2o)) * rho_n2;
-        let mut new_n2_mass_storagetanks = n2_mass_total - new_n2_mass_runtank;
-        
-        if is_rcs_on {
-            new_n2_mass_storagetanks -= self.parameters.n2_mass_flowrate_rcs * dt;
+        // 4. Nitrogen mass balance
+        //    r_mv controls whether nitrogen flows from the storage tanks into the run tank
+        //    to maintain ~65 bar pressure as nitrous is consumed.
+        //
+        //    The ullage volume grows as N2O is consumed. Nitrogen must fill that volume
+        //    to hold the set-point pressure:
+        //      delta_m_n2 = (P_set * delta_V_ullage) / (R_specific_n2 * T)
+        //
+        //    R_specific for N2 = 296.8 J/(kg·K)
+        //    TODO: Update with actual regulator behavior / flow rate limits
+        let r_specific_n2 = 296.8; // J/(kg·K)
+        let p_set = self.parameters.p1_mpa * 1e6; // Convert MPa to Pa (65 bar = 6.5 MPa)
+
+        let new_n2_mass_runtank;
+        let mut new_n2_mass_storagetanks;
+
+        if r_mv_open {
+            // Nitrogen flows in to maintain constant pressure as nitrous depletes
+            let v_ullage_old = self.parameters.runtank_vol - n2o_mass / rho_n2o;
+            let v_ullage_new = self.parameters.runtank_vol - new_n2o_mass / rho_n2o;
+            let delta_v_ullage = (v_ullage_new - v_ullage_old).max(0.0);
+
+            // Mass of N2 needed to fill the new ullage at set pressure
+            let delta_m_n2 = (p_set * delta_v_ullage) / (r_specific_n2 * self.parameters.temp);
+
+            new_n2_mass_runtank = (self.parameters.runtank_vol - new_n2o_mass / rho_n2o) * rho_n2;
+            new_n2_mass_storagetanks = (n2_mass_total - new_n2_mass_runtank - delta_m_n2).max(0.0);
+        } else {
+            // r_mv closed — masses are conserved; pressure drops naturally as ullage expands.
+            // The ideal gas law at the PT tap point (below) captures the pressure change.
+            // RCS N2 consumption is already applied upstream via rcs.update(), so
+            // n2_mass_total already reflects it — no separate subtraction needed here.
+            new_n2_mass_runtank = n2_mass_runtank;
+            new_n2_mass_storagetanks = (n2_mass_total - n2_mass_runtank).max(0.0);
         }
 
-        // 5. Calculate Nitrous fluid level
+        // 5. Vent valve — relieves run tank pressure by venting nitrogen
+        //    TODO: Update with actual vent mass flow rate from hardware specs
+        let o_vnt_mass_flowrate = 0.05; // kg/s placeholder
+        let mut n2_mass_runtank_after_vent = new_n2_mass_runtank;
+        if o_vnt_open {
+            n2_mass_runtank_after_vent = (new_n2_mass_runtank - o_vnt_mass_flowrate * dt).max(0.0);
+        }
+
+        // 6. Calculate Nitrous fluid level
         let tank_cross_sectional_area = std::f64::consts::PI * (self.parameters.tank_d / 2.0).powi(2);
         let new_n2o_level = (new_n2o_mass / rho_n2o) / tank_cross_sectional_area;
 
-        // 6. Return outputs neatly packaged
+        // ── Pressure transducer tap-point calculations ──────────────────────
+        //
+        // These compute the *true* physical pressures at the three PT
+        // locations.  The PT sensors in device_sim then add their own
+        // (very small) noise on top of these values.
+
+        // m2-pt: pressure downstream of the MTV, before the check valve.
+        // For now this is simply the chamber pressure from the flowrate
+        // solver.  See the TODO on FluidDynamicsOutput for the future
+        // check-valve pressure-drop extension.
+        let p_downstream_mtv_bar = fr_sol.pc_bar;
+
+        // o-pt: run tank pressure.  Total pressure = N2 partial pressure + N2O vapor pressure.
+        //   P_N2  = m_N2 * R_N2 * T / V_ullage  (ideal gas law on the nitrogen)
+        //   P_N2O = saturation pressure at tank temperature (from NIST table)
+        // While liquid N2O is present the tank is two-phase and N2O vapor pressure
+        // dominates (~52 bar at 28 °C), so omitting it would severely underestimate
+        // the true tank pressure.
+        let v_ullage = (self.parameters.runtank_vol - new_n2o_mass / rho_n2o).max(1e-9);
+        let p_n2_pa = n2_mass_runtank_after_vent * r_specific_n2 * self.parameters.temp / v_ullage;
+        let p_sat_pa: Vec<f64> = self.parameters.nist_data.p_sat_mpa.iter().map(|&p| p * 1e6).collect();
+        let p_n2o_vapor_pa = Self::interp1(&self.parameters.nist_data.t_sat, &p_sat_pa, self.parameters.temp);
+        let p_runtank_pa = p_n2_pa + p_n2o_vapor_pa;
+        let p_runtank_bar = p_runtank_pa / 1e5;
+
+        // oa-pt: pressure upstream of the run tank, downstream of r_mv.
+        //
+        // We model the short plumbing line between r_mv and the run tank
+        // inlet as a small fixed volume (`line_vol_r_mv`).  This captures
+        // the physical behaviour that:
+        //   • When r_mv is OPEN the regulator maintains set-point pressure
+        //     in the line, so we refill the trapped mass to match.
+        //   • When r_mv is CLOSED no new nitrogen enters.  The trapped
+        //     mass stays constant and the line pressure is simply the
+        //     ideal-gas pressure of that trapped mass in the fixed volume.
+        //     Over time, if the run tank were to draw from this volume
+        //     (not yet modeled), the pressure would drop.
+        //
+        // This is an isothermal ideal-gas approximation — good enough for
+        // GNC-level simulation fidelity.  Replace with a more detailed
+        // model if transient accuracy during valve transitions matters.
+        if r_mv_open {
+            // Regulator keeps the line at set-point.  Recompute trapped mass
+            // so that P_line = P_set.
+            self.n2_mass_line = (p_set * self.parameters.line_vol_r_mv)
+                / (r_specific_n2 * self.parameters.temp);
+        }
+        // else: r_mv is closed — n2_mass_line stays at whatever it was
+        //       when the valve last closed, holding a fixed mass of gas.
+
+        let p_upstream_runtank_pa = self.n2_mass_line * r_specific_n2
+            * self.parameters.temp / self.parameters.line_vol_r_mv;
+        let p_upstream_runtank_bar = p_upstream_runtank_pa / 1e5;
+
+        // 7. Return outputs neatly packaged
         FluidDynamicsOutput {
             thrust_realized: fr_sol.thrust_realized,
             valve_angle: ang_sol.theta_deg,
@@ -453,13 +600,16 @@ impl ThermoFluidSolver {
             new_fuel_mass: fr_sol.fuel_mass,
             new_n2o_mass,
             new_n2o_level,
-            new_n2_mass_runtank,
+            new_n2_mass_runtank: n2_mass_runtank_after_vent,
             new_n2_mass_storagetanks,
             new_port_d: fr_sol.new_port_d,
             of_ratio_realized: fr_sol.of_ratio_realized,
             isp_realized: fr_sol.isp_realized,
             cstar_realized: fr_sol.cstar_realized,
             pc_bar: fr_sol.pc_bar,
+            p_downstream_mtv_bar,
+            p_runtank_bar,
+            p_upstream_runtank_bar,
         }
     }
         

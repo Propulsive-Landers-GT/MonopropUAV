@@ -51,6 +51,40 @@ impl RefreshUpdater {
     }
 }
 
+/// A simple on/off valve used throughout the propellant feed system.
+/// These model actuated valves (solenoid or pneumatic) that are either
+/// fully open or fully closed — no partial opening or transition dynamics.
+///
+/// Valves in the system:
+///   - fill_mv : Fill valve (entry to lander tanks, irrelevant in flight)
+///   - r_mv    : Regulator isolation valve (N2 storage → N2O run tank)
+///   - rcs1_mv : RCS thruster pair 1 (controls one roll direction)
+///   - rcs2_mv : RCS thruster pair 2 (controls opposite roll direction)
+///   - o_iso   : Oxidizer isolation valve (N2O run tank → MTV/engine)
+///   - o_vnt   : Oxidizer vent valve (relieves run tank pressure)
+///
+/// TODO: Consider integrating valve commands into the control_input vector
+///       when we want the GNC algorithms to drive these valves directly.
+#[derive(Debug, Clone)]
+pub struct Valve {
+    pub is_open: bool,
+}
+
+impl Valve {
+    pub fn new(is_open: bool) -> Self {
+        Self { is_open }
+    }
+
+    pub fn open(&mut self) {
+        self.is_open = true;
+    }
+
+    pub fn close(&mut self) {
+        self.is_open = false;
+    }
+}
+
+
 /*
 Acceleration units are in m/s^2
 Gyro units are in rad/s
@@ -674,6 +708,8 @@ impl RCS {
     }
 
     pub fn default() -> Self {
+        // TODO: Update these placeholder values with actual RCS hardware data
+        //       once the team has better loadcell calibration numbers.
         let rcs_thrust = 10.0;
         let rcs_lever_arm = 0.15;
         let rcs_nitrogen_consumption_rate = 0.1;
@@ -682,33 +718,49 @@ impl RCS {
         Self::new(rcs_thrust, rcs_lever_arm, rcs_nitrogen_consumption_rate, rcs_update_rate)
     }
 
-    // The command is either positive, 0, or negative. positive is roll right, negative is roll left
-    // returns the torque on the rocket body
-    pub fn update(&mut self, command: f64, nitrogen_mass: f64, dt: f64, system_time: f64) -> RCSEffect {
+    // Each RCS valve controls a pair of thrusters for one roll direction.
+    //   rcs1_mv open → clockwise roll  (negative Z torque)
+    //   rcs2_mv open → counter-clockwise roll (positive Z torque)
+    //
+    // Both valves can be open simultaneously (each is independently controlled).
+    // When both are open the torques cancel but N2 is consumed by both pairs.
+    pub fn update(&mut self, rcs1_open: bool, rcs2_open: bool, nitrogen_mass: f64, dt: f64, system_time: f64) -> RCSEffect {
         let mut remaining_nitrogen_mass = nitrogen_mass;
-        let mut actual_command = command;
 
         let elapsed_time = system_time - self.system_time;
-        if elapsed_time < 1.0 / self.update_rate {
-            actual_command = self.last_command;
+        // Determine the effective valve states — hold previous state between update ticks
+        // Encoding: 2.0 = both open, 1.0 = rcs1 only, -1.0 = rcs2 only, 0.0 = neither
+        let (active_rcs1, active_rcs2) = if elapsed_time < 1.0 / self.update_rate {
+            // Between update ticks: hold previous command
+            let prev_rcs1 = self.last_command == 1.0 || self.last_command == 2.0;
+            let prev_rcs2 = self.last_command == -1.0 || self.last_command == 2.0;
+            (prev_rcs1, prev_rcs2)
         } else {
             self.system_time = system_time;
-        }
+            // Encode the current valve state into last_command for hold logic
+            if rcs1_open && rcs2_open {
+                self.last_command = 2.0;
+            } else if rcs1_open {
+                self.last_command = 1.0;
+            } else if rcs2_open {
+                self.last_command = -1.0;
+            } else {
+                self.last_command = 0.0;
+            }
+            (rcs1_open, rcs2_open)
+        };
         
-        let torque_magnitude = 2.0 * self.thrust * self.lever_arm;
-        let mut torque;
-        if actual_command == 0.0 {
-            // No action needed
-            torque = Vector3::zeros();
-        } else if actual_command > 0.0 {
-            // Positive Command -> Negative Z Torque
-            // This will roll clockwise from a top view
-            torque = Vector3::new(0.0, 0.0, -torque_magnitude);
+        let torque_per_pair = 2.0 * self.thrust * self.lever_arm;
+        let mut torque = Vector3::zeros();
+
+        if active_rcs1 {
+            // rcs1_mv open → Negative Z Torque (clockwise from top view)
+            torque.z -= torque_per_pair;
             remaining_nitrogen_mass -= self.nitrogen_consumption_rate * dt;
-        } else {
-            // Negative Command -> Positive Z Torque
-            // This will roll counterclockwise from a top view
-            torque = Vector3::new(0.0, 0.0, torque_magnitude);
+        }
+        if active_rcs2 {
+            // rcs2_mv open → Positive Z Torque (counter-clockwise from top view)
+            torque.z += torque_per_pair;
             remaining_nitrogen_mass -= self.nitrogen_consumption_rate * dt;
         }
 
@@ -718,6 +770,98 @@ impl RCS {
         }
     }
 }
+
+/// A simulated pressure transducer (PT) that measures static pressure at a
+/// specific point in the propellant feed system.
+///
+/// Unlike inertial sensors (IMU) or radio-based sensors (GPS, UWB), pressure
+/// transducers are direct-measurement devices and are extremely stable.
+/// Aerospace piezoresistive PTs typically achieve ±0.1–0.5% of Full Scale
+/// Output (FSO) total accuracy, with the dominant error source being a fixed
+/// calibration offset (bias) rather than random noise.  For a 100 bar FS
+/// sensor, actual measurement noise is on the order of ±0.005 bar — effectively
+/// negligible step-to-step.
+///
+/// Each PT outputs a scalar pressure reading [bar] with a small Gaussian noise
+/// component and an optional fixed bias.  A configurable update rate models
+/// the real sensor's sample-and-hold behaviour.
+///
+/// PTs on this vehicle:
+///   - m2_pt  : Downstream of the MTV, before the check valve.
+///              Reads the line pressure between the throttle valve and engine.
+///   - o_pt   : Immediately downstream of the N2O run tank, before o_vnt.
+///              Used by the vent controller to decide whether/how long to
+///              open the oxidizer vent valve.
+///   - oa_pt  : Upstream of the N2O run tank, downstream of r_mv.
+///              Reads the regulated nitrogen supply pressure entering the
+///              run tank.
+#[derive(Debug, Clone)]
+pub struct PressureTransducer {
+    /// Human-readable label for logging (e.g. "m2-pt")
+    pub label: String,
+    /// Standard deviation of the Gaussian measurement noise [bar].
+    /// Typical value for a 100 bar FS piezoresistive PT is ~0.005 bar.
+    pub noise_sigma: f64,
+    /// Fixed measurement bias (calibration offset) [bar]
+    pub bias: f64,
+    /// Most recent output (held between update ticks)
+    pub last_reading: PTReading,
+    /// Sensor sample rate [Hz] — piezoresistive PTs commonly run at 1 kHz+
+    pub update_rate: f64,
+    /// Internal clock tracking when the last update was issued
+    system_time: f64,
+}
+
+/// A single pressure transducer reading.
+#[derive(Debug, Clone)]
+pub struct PTReading {
+    /// Measured pressure [bar], including noise and bias
+    pub pressure_bar: f64,
+}
+
+impl PressureTransducer {
+    pub fn new(label: &str, noise_sigma: f64, bias: f64, update_rate: f64) -> Self {
+        Self {
+            label: label.to_string(),
+            noise_sigma,
+            bias,
+            last_reading: PTReading { pressure_bar: 0.0 },
+            update_rate,
+            system_time: 0.0,
+        }
+    }
+
+    /// Convenience constructor with realistic defaults for a 0–100 bar
+    /// aerospace piezoresistive PT:
+    ///   - 0.005 bar noise sigma  (~0.005% FS — essentially negligible)
+    ///   - Zero bias
+    ///   - 1000 Hz sample rate
+    pub fn default_with_label(label: &str) -> Self {
+        Self::new(label, 0.005, 0.0, 1000.0)
+    }
+
+    /// Feed the sensor the true local pressure.  Returns a (possibly stale)
+    /// reading.  Between update ticks the previous value is returned unchanged,
+    /// matching sample-and-hold hardware behaviour.
+    pub fn update(&mut self, true_pressure_bar: f64, system_time: f64) -> PTReading {
+        let elapsed = system_time - self.system_time;
+        if elapsed < 1.0 / self.update_rate {
+            return self.last_reading.clone();
+        }
+
+        self.system_time = system_time;
+
+        let mut rng = rand::rng();
+        let noise = noise_1_d(self.noise_sigma, &mut rng);
+
+        self.last_reading = PTReading {
+            pressure_bar: true_pressure_bar + self.bias + noise,
+        };
+
+        self.last_reading.clone()
+    }
+}
+
 
 // Helper to generate 3D noise
 pub fn noise_3_d(sigma: &Vector3<f64>, rng: &mut ThreadRng) -> Vector3<f64> {
