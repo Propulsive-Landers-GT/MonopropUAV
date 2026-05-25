@@ -426,23 +426,19 @@ pub struct MTV {
 
     pub valve_torque: f64,
 
-    starting_fuel_grain_mass: f64,
-
     pub update_rate: f64,
     system_time: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct MTVEffect {
-    pub nitrogen_mass: f64,
-    pub pressurizing_nitrogen_mass: f64,
-    pub nitrous_mass: f64,
-    pub fuel_grain_mass: f64,
-    pub thrust: Vector3<f64>,
+    pub angle: f64,
+    pub ang_vel: f64,
+    pub ang_accel: f64,
 }
 
 impl MTV {
-    pub fn new(angle: f64, ang_vel: f64, ang_accel: f64, unloaded_speed: f64, stall_torque: f64, p_gain: f64, valve_torque: f64, starting_fuel_grain_mass: f64, update_rate: f64) -> Self {
+    pub fn new(angle: f64, ang_vel: f64, ang_accel: f64, unloaded_speed: f64, stall_torque: f64, p_gain: f64, valve_torque: f64, update_rate: f64) -> Self {
         Self {
             angle,
             ang_vel,
@@ -451,13 +447,12 @@ impl MTV {
             stall_torque,
             p_gain,
             valve_torque,
-            starting_fuel_grain_mass,
             update_rate,
             system_time: 0.0,
         }
     }
 
-    pub fn default(starting_fuel_grain_mass: f64) -> Self {
+    pub fn default() -> Self {
         let mtv_angle = 60.0;
         let mtv_ang_vel = 0.0;
         let mtv_ang_accel = 0.0;
@@ -467,10 +462,10 @@ impl MTV {
         let mtv_valve_torque = 30.0;
         let mtv_update_rate = 200.0;
 
-        Self::new(mtv_angle, mtv_ang_vel, mtv_ang_accel, mtv_unloaded_speed, mtv_stall_torque, mtv_p_gain, mtv_valve_torque, starting_fuel_grain_mass, mtv_update_rate)
+        Self::new(mtv_angle, mtv_ang_vel, mtv_ang_accel, mtv_unloaded_speed, mtv_stall_torque, mtv_p_gain, mtv_valve_torque, mtv_update_rate)
     }
 
-    pub fn update(&mut self, target_thrust: f64, nitrogen_mass: f64, pressurizing_nitrogen_mass: f64, nitrous_mass: f64, fuel_grain_mass: f64, dt: f64, system_time: f64) -> MTVEffect {
+    pub fn update(&mut self, target_thrust: f64, thermo_fluid_solver: &mut ThermoFluidSolver, dt: f64, system_time: f64) -> MTVEffect {
         let elapsed_time = system_time - self.system_time;
         if elapsed_time < 1.0 / self.update_rate {
             // angular velocity stays constant, therefore angular acceleration is zero, but angle does update
@@ -481,7 +476,8 @@ impl MTV {
 
             self.system_time = system_time;
 
-            let target_angle = self.get_target_angle(target_thrust);
+            // let target_angle = self.get_target_angle(target_thrust);
+            let target_angle = thermo_fluid_solver.thrust_to_valve_angle(target_thrust, dt).unwrap_or(0.0);
             // self.angle = target_angle; // TODO: For now, we will assume the MTV can achieve the target angle within one time step. Replace with actual dynamics later.
 
             let error = target_angle - self.angle;
@@ -497,11 +493,16 @@ impl MTV {
             self.angle = nalgebra::clamp(self.angle, 0.0, 90.0);
         }
 
-        let mtv_effect = self.get_thrust(nitrogen_mass, pressurizing_nitrogen_mass, nitrous_mass, fuel_grain_mass, dt);
+        let mtv_effect = MTVEffect {
+            angle: self.angle,
+            ang_vel: self.ang_vel,
+            ang_accel: self.ang_accel,
+        };
 
         return mtv_effect;
     }
 
+    // Likely not needed anymore as we are using the thermo-fluid solver for this, could possibly implement some noise?
     pub fn get_target_angle(&mut self, target_thrust: f64) -> f64 {
         // TODO: implement target angle calculation based on thrust
         
@@ -510,47 +511,6 @@ impl MTV {
         let target_angle = 90.0 * (0.1 * ((target_thrust - 300.0) / 300.0).exp() - 0.05);
         println!("Target Thrust: {}, Target Angle: {}", target_thrust, target_angle);
         target_angle
-    }
-
-    pub fn get_thrust(&mut self, nitrogen_mass:f64, pressurizing_nitrogen_mass: f64, nitrous_mass: f64, fuel_grain_mass: f64, dt: f64) -> MTVEffect {
-        // TODO: update the nitrogen, nitrous, and fuel grain masses (nitrogen is used to pressurize the tank, so nitrogen will flow out of the nitrogen tank into the nitrous tank)
-        // TODO: use the current throttle angle to find the flow rate, then determine thrust
-        // Remember to take into account either mass running out
-        // TODO: also model the thrust decay somehow?
-
-        if nitrous_mass <= 0.0 || fuel_grain_mass <= 0.0 {
-            return MTVEffect {
-                nitrogen_mass,
-                pressurizing_nitrogen_mass,
-                nitrous_mass,
-                fuel_grain_mass,
-                thrust: Vector3::zeros(),
-            };
-        }
-
-        // y = 300 * ln((x + 0.05) / 0.1) + 300 is an example thrust curve. Replace later with true relation
-        let thrust = 300.0 * ((self.angle / 90.0 + 0.05) / 0.1).ln() + 300.0;
-        println!("MTV Angle: {}, Thrust: {}", self.angle, thrust);
-        // let nitrous_alpha = 1.0/(9.81 * 180.0);
-        // let nitrogen_alpha = 1.0/(9.81 * 180.0);
-        // let fuel_grain_alpha = 1.0/(9.81 * 180.0);
-        let nitrous_alpha = 0.0;
-        let nitrogen_alpha = 0.0;
-        let fuel_grain_alpha = 0.0;
-
-        let new_nitrogen_mass = (nitrogen_mass - nitrogen_alpha * thrust * dt).max(0.0);
-        let new_pressurizing_nitrogen_mass = (pressurizing_nitrogen_mass + nitrogen_alpha * thrust * dt).max(0.0);
-        let new_nitrous_mass = (nitrous_mass - nitrous_alpha * thrust * dt).max(0.0);
-        let new_fuel_grain_mass = (fuel_grain_mass - fuel_grain_alpha * thrust * dt).max(0.0);
-
-
-        MTVEffect {
-            nitrogen_mass: new_nitrogen_mass,
-            pressurizing_nitrogen_mass: new_pressurizing_nitrogen_mass,
-            nitrous_mass: new_nitrous_mass,
-            fuel_grain_mass: new_fuel_grain_mass,
-            thrust: Vector3::new(0.0, 0.0, thrust),
-        }
     }
 }
 
@@ -566,17 +526,12 @@ pub struct TVC {
     pub actuator_lever_arm: f64,
     pub max_fuel_inertia: f64,
     pub min_fuel_inertia: f64,
-    starting_fuel_grain_mass: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct TVCEffect {
     pub thrust: Vector3<f64>,
     pub torque: Vector3<f64>,
-    pub nitrogen_mass: f64,
-    pub pressurizing_nitrogen_mass: f64,
-    pub nitrous_mass: f64,
-    pub fuel_grain_mass: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -587,7 +542,7 @@ pub struct ActuatorPositions {
 
 impl TVC {
     // Our actuators appear to have a stall force of 400 lbf (need to convert to metric) and an unloaded speed of 4.777173913 in/s (also convert)
-    pub fn new(mtv: MTV, x_actuator: TVCActuator, y_actuator: TVCActuator, actuator_lever_arm: f64, max_fuel_inertia: f64, min_fuel_inertia: f64, starting_fuel_grain_mass: f64) -> Self {
+    pub fn new(mtv: MTV, x_actuator: TVCActuator, y_actuator: TVCActuator, actuator_lever_arm: f64, max_fuel_inertia: f64, min_fuel_inertia: f64) -> Self {
         Self {
             mtv,
             x_actuator,
@@ -598,12 +553,11 @@ impl TVC {
             actuator_lever_arm,
             max_fuel_inertia,
             min_fuel_inertia,
-            starting_fuel_grain_mass,
         }
     }
 
-    pub fn default(starting_fuel_grain_mass: f64) -> Self {
-        let mtv = MTV::default(starting_fuel_grain_mass);
+    pub fn default() -> Self {
+        let mtv = MTV::default();
         let x_actuator = TVCActuator::default();
         let y_actuator = TVCActuator::default();
         let tvc_actuator_lever_arm = 0.1;
@@ -611,27 +565,26 @@ impl TVC {
         let tvc_max_fuel_inertia = 3.0;
         let tvc_min_fuel_inertia = 8.0;
 
-        Self::new(mtv, x_actuator, y_actuator, tvc_actuator_lever_arm, tvc_max_fuel_inertia, tvc_min_fuel_inertia, starting_fuel_grain_mass)
+        Self::new(mtv, x_actuator, y_actuator, tvc_actuator_lever_arm, tvc_max_fuel_inertia, tvc_min_fuel_inertia)
     }
 
     // engine is 11 kg with fuel, awaiting empty mass data
     // Returns the reaction torque applied to the rocket body
     // only the first two elements of command are used, the third is thrust
-    pub fn update(&mut self, command: Vector3<f64>, tvc_lever_arm: Vector3<f64>, nitrogen_mass: f64, pressurizing_nitrogen_mass: f64, nitrous_mass: f64, fuel_grain_mass: f64, dt: f64, system_time: f64) -> TVCEffect {
-        let mtv_effect = self.mtv.update(command[2], nitrogen_mass, pressurizing_nitrogen_mass,nitrous_mass, fuel_grain_mass, dt, system_time);
+    pub fn update(&mut self, command: Vector3<f64>, tvc_lever_arm: Vector3<f64>, percent_fuel_grain_mass: f64, thermo_fluid_solver: &mut ThermoFluidSolver, thrust_realized: f64, dt: f64, system_time: f64) -> TVCEffect {
+        let mtv_effect = self.mtv.update(command[2], thermo_fluid_solver, dt, system_time);
 
-        let engine_inertia = self.min_fuel_inertia + (self.max_fuel_inertia - self.min_fuel_inertia) * (fuel_grain_mass / self.starting_fuel_grain_mass);
+        let engine_inertia = self.min_fuel_inertia + (self.max_fuel_inertia - self.min_fuel_inertia) * percent_fuel_grain_mass;
         let x_load = (engine_inertia * self.x_actuator.get_accel()) / self.actuator_lever_arm.powi(2);
         let y_load = (engine_inertia * self.y_actuator.get_accel()) / self.actuator_lever_arm.powi(2);
 
         // TODO: translate gimbal angle commands to actuator target positions and update ang vels and ang accel
-        let x_target = 0.0;
-        let y_target = 0.0;
+        let target_pos = self.get_target_position(command);
         let x_angle = command[0];
         let y_angle = command[1];
 
-        self.x_actuator.update(x_target, x_load, dt, system_time);
-        self.y_actuator.update(y_target, y_load, dt, system_time);
+        self.x_actuator.update(target_pos.x_position, x_load, dt, system_time);
+        self.y_actuator.update(target_pos.y_position, y_load, dt, system_time);
 
         let reaction_torque = self.ang_accel * engine_inertia * -1.0;
         
@@ -648,7 +601,7 @@ impl TVC {
         // Combine them (Order matters! Match your physical gimbal design)
         let gimbal_rotation = y_rot * x_rot;
 
-        let thrust_vector = gimbal_rotation.transform_vector(&mtv_effect.thrust);
+        let thrust_vector = gimbal_rotation.transform_vector(&Vector3::new(0.0, 0.0, thrust_realized));
         let thrust_torque = tvc_lever_arm.cross(&thrust_vector);
 
         self.tvc_torque = reaction_torque + thrust_torque;
@@ -656,10 +609,13 @@ impl TVC {
         return TVCEffect {
             thrust: thrust_vector,
             torque: self.tvc_torque.clone(),
-            nitrogen_mass: mtv_effect.nitrogen_mass,
-            pressurizing_nitrogen_mass: mtv_effect.pressurizing_nitrogen_mass,
-            nitrous_mass: mtv_effect.nitrous_mass,
-            fuel_grain_mass: mtv_effect.fuel_grain_mass,
+        };
+    }
+
+    pub fn get_target_position(&self, command: Vector3<f64>) -> ActuatorPositions {
+        return ActuatorPositions {
+            x_position: 0.0,
+            y_position: 0.0,
         };
     }
 
@@ -668,11 +624,6 @@ impl TVC {
             x_position: self.x_actuator.get_noisy_position(),
             y_position: self.y_actuator.get_noisy_position(),
         };
-    }
-
-    pub fn get_chamber_pressure(&self) -> f64 {
-        // TODO: implement chamber pressure calculation
-        0.0
     }
 }
 

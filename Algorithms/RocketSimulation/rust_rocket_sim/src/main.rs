@@ -72,9 +72,9 @@ pub fn export_imu_to_csv(
 fn main() {
     let mut sim = Simulation::default();
     sim.debug = true;
-    sim.rocket.position = Vector3::new(0.0, 0.0, 49.0);
-    sim.start_state = "hover".to_string();
-    sim.min_time = 3.0;
+    // sim.rocket.position = Vector3::new(0.0, 0.0, 49.0);
+    // sim.start_state = "hover".to_string();
+    // sim.min_time = 3.0;
 
     sim.init();
 

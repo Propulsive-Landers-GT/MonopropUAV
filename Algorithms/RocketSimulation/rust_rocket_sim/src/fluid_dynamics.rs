@@ -424,6 +424,25 @@ impl ThermoFluidSolver {
 
         best_flow_solution
     }
+
+    /// Dynamically calculates the required valve angle for a commanded thrust.
+    /// Call this every physics tick to map GNC commands to mechanical states.
+    pub fn thrust_to_valve_angle(
+        &mut self,
+        target_thrust: f64,
+        dt: f64,
+    ) -> Result<f64, &'static str> {
+        
+        // 1. Run the flowrate solver to find the required mass flow and chamber pressure
+        // to hit this specific thrust target.
+        let flow_sol = self.flowrate_solver(target_thrust, dt).ok_or("Flowrate solver failed to converge")?;
+
+        // 2. Feed that required flow state into the angle solver to find the 
+        // exact physical valve angle (theta) needed to restrict the flow to that rate.
+        let angle_sol = self.angle_solver(flow_sol.mdot_ox, flow_sol.pc_bar)?;
+
+        Ok(angle_sol.theta_deg)
+    }
     
     pub fn fluid_dynamics_update(
         &mut self,

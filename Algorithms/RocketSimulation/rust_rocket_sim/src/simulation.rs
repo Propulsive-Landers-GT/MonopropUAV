@@ -281,10 +281,10 @@ impl Simulation {
         if self.traj_stage == 0 {
             // 1. Stage Cost (Q) - Massive penalty for Z errors
             self.mpc.q = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 200.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
+                150.0, 150.0, 600.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
                 40000.0, 40000.0, 0.0, 0.0,
                 // 100.0, 100.0, 6000.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
-                100.0, 100.0, 1000.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
+                100.0, 100.0, 2000.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
                 500.0, 500.0, 500.0   
             ]));
 
@@ -294,9 +294,9 @@ impl Simulation {
 
             // 3. Terminal Cost (QN) - Land softly!
             self.mpc.qn = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 400.0, 
+                150.0, 150.0, 600.0, 
                 50000.0, 50000.0, 0.0, 0.0,
-                100.0, 100.0, 1000.0, 
+                100.0, 100.0, 2000.0, 
                 1000.0, 1000.0, 1000.0 
             ]));
             self.lossless.use_terminal_lateral_hard_tube = true;
@@ -359,9 +359,9 @@ impl Simulation {
 
             // 3. Terminal Cost (QN) - Land softly!
             self.mpc.qn = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 3000.0, 
+                150.0, 150.0, 800.0, 
                 100000.0, 100000.0, 0.0, 0.0,
-                100.0, 100.0, 1000.0, 
+                100.0, 100.0, 2000.0, 
                 1000.0, 1000.0, 1000.0 
             ]));
             self.lossless.lower_thrust_bound = 500.0;
@@ -374,7 +374,7 @@ impl Simulation {
             // if self.rocket.velocity.norm() >= 5.0 {
             //     self.lossless.max_velocity = self.rocket.velocity.norm() * 1.25;
             // }
-            let trajectory = self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 1.5-1.5], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
+            let trajectory = self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 1.5-1.0], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
             (xref_traj, uref_traj) = self.get_mpc_reference(&trajectory, self.current_time - self.lossless.last_solve_time, self.rocket.attitude, self.mpc.min_thrust, self.mpc.dt, self.lossless.fine_delta_t, self.mpc.n_steps + 1);
             if self.current_time - self.traj_timer > 30.0 {
                 self.traj_stage = -1;
@@ -448,10 +448,15 @@ impl Simulation {
                     let dt_overfill = t_target - traj.time_of_flight_s;
                     
                     // Extrapolate position: p = p_final + v_final * dt
+                    // interp_p = [
+                    //     final_p[0] + final_v[0] * dt_overfill,
+                    //     final_p[1] + final_v[1] * dt_overfill,
+                    //     final_p[2] + final_v[2] * dt_overfill,
+                    // ];
                     interp_p = [
-                        final_p[0] + final_v[0] * dt_overfill,
-                        final_p[1] + final_v[1] * dt_overfill,
-                        final_p[2] + final_v[2] * dt_overfill,
+                        final_p[0],
+                        final_p[1],
+                        final_p[2],
                     ];
                     
                     // Keep asking for the final velocity to prevent the MPC from braking too early

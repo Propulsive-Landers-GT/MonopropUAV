@@ -310,7 +310,7 @@ impl Rocket {
         let tvc_range = 15_f64.to_radians();
 
         
-        let tvc = TVC::default(starting_fuel_grain_mass);
+        let tvc = TVC::default();
 
         let rcs = RCS::default();
 
@@ -386,30 +386,9 @@ impl Rocket {
         self.moi = self.get_moi(self.thrust_vector, com_offset);
         // println!("ROCKET MOI: {:?}", self.moi);
         // println!("TVC_LEVER_ARM: {:?}", self.frame_com_to_gimbal - com_offset);
-
-        // Update actuated devices
-        let tvc_effect: TVCEffect = self.tvc.update(Vector3::new(control_input.x, control_input.y, control_input.z), self.frame_com_to_gimbal - com_offset, self.nitrogen_mass, self.pressurizing_nitrogen_mass, self.nitrous_mass, self.fuel_grain_mass, dt, self.system_time);
-        self.nitrogen_mass = tvc_effect.nitrogen_mass;
-        self.pressurizing_nitrogen_mass = tvc_effect.pressurizing_nitrogen_mass;
-        self.nitrous_mass = tvc_effect.nitrous_mass;
-        self.fuel_grain_mass = tvc_effect.fuel_grain_mass;
-
-        // TODO: implement throttle controller
-        // TODO: Consider expanding control_input to drive valve commands from GNC algorithms.
-        //       For now, RCS valves are toggled based on the sign of the roll command.
-        let rcs_command = control_input.w; // 4th element is the roll command
-        // Map the scalar roll command to individual valve states:
-        //   positive → rcs1_mv opens (clockwise roll)
-        //   negative → rcs2_mv opens (counter-clockwise roll)
-        //   zero     → both closed
-        let rcs1_open = self.rcs1_mv.is_open || rcs_command > 0.0;
-        let rcs2_open = self.rcs2_mv.is_open || rcs_command < 0.0;
-        let rcs_effect = self.rcs.update(rcs1_open, rcs2_open, self.nitrogen_mass, dt, self.system_time);
-        self.nitrogen_mass = rcs_effect.nitrogen_mass;
-
         
         // Fluid dynamics update — pass valve states to control flow paths
-        let thrust_command = control_input[2];
+        let thrust_command = control_input[2]; // TODO: make this reflect the current mtv valve state rather than the actual thrust command?
         let n2o_mass = self.nitrous_mass;
         let n2_mass_runtank = self.pressurizing_nitrogen_mass;
         let n2_mass_total = self.nitrogen_mass + self.pressurizing_nitrogen_mass;
@@ -453,6 +432,22 @@ impl Rocket {
         self.debug_info.m2_pt_readings.push(m2_pt_reading);
         self.debug_info.o_pt_readings.push(o_pt_reading);
         self.debug_info.oa_pt_readings.push(oa_pt_reading);
+
+        // Update actuated devices
+        let tvc_effect: TVCEffect = self.tvc.update(Vector3::new(control_input.x, control_input.y, control_input.z), self.frame_com_to_gimbal - com_offset, self.fuel_grain_mass / self.starting_fuel_grain_mass, &mut self.thermo_fluid_solver, fluid_dynamics_output.thrust_realized, dt, self.system_time);
+
+        // TODO: implement throttle controller
+        // TODO: Consider expanding control_input to drive valve commands from GNC algorithms.
+        //       For now, RCS valves are toggled based on the sign of the roll command.
+        let rcs_command = control_input.w; // 4th element is the roll command
+        // Map the scalar roll command to individual valve states:
+        //   positive → rcs1_mv opens (clockwise roll)
+        //   negative → rcs2_mv opens (counter-clockwise roll)
+        //   zero     → both closed
+        let rcs1_open = self.rcs1_mv.is_open || rcs_command > 0.0;
+        let rcs2_open = self.rcs2_mv.is_open || rcs_command < 0.0;
+        let rcs_effect = self.rcs.update(rcs1_open, rcs2_open, self.nitrogen_mass, dt, self.system_time);
+        self.nitrogen_mass = rcs_effect.nitrogen_mass;
 
 
         self.system_time += dt;
@@ -635,9 +630,9 @@ impl Rocket {
         let tvc_com = self.frame_com_to_gimbal + rotation * self.gimbal_to_tvc_com;
 
 
-        let combined_com = (nitrogen_com * (self.nitrogen_tank_empty_mass + self.nitrogen_mass) / total_mass
+        let combined_com = nitrogen_com * (self.nitrogen_tank_empty_mass + self.nitrogen_mass) / total_mass
                             + nitrous_com * (nitrous_tank_mass) / total_mass
-                            + tvc_com * (self.tvc_module_empty_mass + self.fuel_grain_mass) / total_mass);
+                            + tvc_com * (self.tvc_module_empty_mass + self.fuel_grain_mass) / total_mass;
         
         combined_com
     }
