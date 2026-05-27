@@ -295,8 +295,8 @@ impl Rocket {
         let wet_nitrogen_moi = Matrix3::new(1.0075, 0.0, 0.0,
                                             0.0, 1.0075, 0.0,
                                             0.0, 0.0, 1.055);
-        let nitrous_tank_radius = 0.0;
-        let nitrous_tank_length = 0.0;
+        let nitrous_tank_radius = 0.15;
+        let nitrous_tank_length = 0.75;
         let nitrous_level = 0.85 * 0.75;
         let dry_nitrous_moi = Matrix3::new(1.31, 0.0, 0.0,
                                             0.0, 1.31, 0.0,
@@ -352,25 +352,7 @@ impl Rocket {
     /// forces: Force vector in World Frame
     /// torques: Torque vector in Body Frame
     /// Returns true if the step is successful and false if the simulation has ended (hit the ground)
-    pub fn step(&mut self, control_input: Vector4<f64>, outside_forces: Vector3<f64>, outside_torques: Vector3<f64>, dt: f64) -> bool {
-        let rotated_offset = self.attitude.transform_vector(&self.com_to_ground);
-        let rocket_bottom = self.position + rotated_offset;
-        if rocket_bottom.z < 0.0 {
-            // 1. Shift the rocket UP by the exact amount it went underground.
-            // (Because rocket_bottom.z is negative, subtracting it adds positive height)
-            self.position.z -= rocket_bottom.z; // Add a small buffer of 1 cm to prevent immediate re-collision on the next frame
-
-            // 2. CRITICAL: Kill the downward velocity!
-            // If you don't do this, the math still thinks it's falling at -5m/s, 
-            // and it will just instantly clip back underground on the next frame.
-            self.velocity.x = 0.0;
-            self.velocity.y = 0.0;
-            if self.velocity.z < 0.0 { // Assuming your velocity variable is named this
-                self.velocity.z = 0.0;
-            }
-            return false; // Indicate that we've hit the ground
-        }
-        
+    pub fn step(&mut self, control_input: Vector4<f64>, outside_forces: Vector3<f64>, outside_torques: Vector3<f64>, dt: f64) -> bool {        
         self.debug_info.times.push(self.system_time);
 
         // Update Sensors
@@ -600,6 +582,25 @@ impl Rocket {
             let axis = UnitQuaternion::from_axis_angle(&nalgebra::Unit::new_normalize(self.ang_vel), angle);
             // Apply rotation: new_attitude = old_attitude * delta_rotation
             self.attitude = self.attitude * axis;
+        }
+
+        // Floor check
+        let rotated_offset = self.attitude.transform_vector(&self.com_to_ground);
+        let rocket_bottom = self.position + rotated_offset;
+        if rocket_bottom.z < 0.0 {
+            // 1. Shift the rocket UP by the exact amount it went underground.
+            // (Because rocket_bottom.z is negative, subtracting it adds positive height)
+            self.position.z -= rocket_bottom.z; // Add a small buffer of 1 cm to prevent immediate re-collision on the next frame
+
+            // 2. CRITICAL: Kill the downward velocity!
+            // If you don't do this, the math still thinks it's falling at -5m/s, 
+            // and it will just instantly clip back underground on the next frame.
+            self.velocity.x = 0.0;
+            self.velocity.y = 0.0;
+            if self.velocity.z < 0.0 { // Assuming your velocity variable is named this
+                self.velocity.z = 0.0;
+            }
+            return false; // Indicate that we've hit the ground
         }
 
         return true; // Indicate successful step

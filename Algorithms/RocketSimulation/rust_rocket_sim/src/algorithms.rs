@@ -94,7 +94,8 @@ impl MPC {
         let system_time = -1.0;
         // let update_rate = 50.0;
         // let refresh_updater = RefreshUpdater::new(0.005, 0.001, 0.00025, 0.00025);
-        let refresh_updater = RefreshUpdater::new(0.01, 0.0, 0.0, 0.0);
+        let mut refresh_updater = RefreshUpdater::new(0.01, 0.0, 0.0, 0.0);
+        refresh_updater.reset(0.0, system_time);
 
         Self::new(n, m, n_steps, dt, integral_gains, q, r, qn, smoothing_weight, panoc_cache_tolerance, panoc_cache_lbfgs_memory, min_thrust, max_thrust, gimbal_limit, system_time, refresh_updater)
     }
@@ -367,7 +368,8 @@ impl Lossless {
         let timeout = 5.0;
         let system_time = -1.0;
         // let update_rate = 3.0;
-        let lossless_refresh_updater = LosslessRefreshUpdater::default();
+        let mut lossless_refresh_updater = LosslessRefreshUpdater::default();
+        lossless_refresh_updater.reset(0.0, 0.0, system_time);
 
         Self::new(
             max_velocity,
@@ -412,9 +414,9 @@ impl Lossless {
         if self.lossless_refresh_updater.update(system_time) {
             // rerun mpc, find iterations, run iter_update() on refresh_updater
             let (trajectory, debug_info) = self.solve(current_position, current_velocity, target_position, propellant_mass);
-            self.current_traj = self.cached_traj.clone();
-            self.cached_traj = trajectory.clone();
             if debug_info.converged {
+                self.current_traj = self.cached_traj.clone();
+                self.cached_traj = trajectory.clone();
                 self.last_solve_time = self.cached_solve_time;
                 self.cached_solve_time = system_time;
             }

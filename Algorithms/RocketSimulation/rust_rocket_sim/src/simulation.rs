@@ -117,9 +117,13 @@ impl Simulation {
             _ => self.end_stage = -1,
         }
 
+        self.lossless.system_time = -30.0;
+        self.lossless.lossless_refresh_updater.reset(0.0, 0.0, self.lossless.system_time);
         self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 50.0], self.rocket.get_mass() - self.rocket.get_dry_mass(), -20.0);
         self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 50.0], self.rocket.get_mass() - self.rocket.get_dry_mass(), -10.0);
 
+        self.mpc.system_time = -20.0;
+        self.mpc.refresh_updater.reset(0.0, self.mpc.system_time);
         self.mpc.update(&self.rocket.get_state(), &vec![Array1::zeros(13); self.mpc.n_steps + 1], &vec![Array1::zeros(3); self.mpc.n_steps], self.rocket.get_mass(), &self.rocket.get_moi_mpc(), -10.0);
         
         let (_, _, yaw) = self.rocket.attitude.euler_angles();
@@ -347,9 +351,9 @@ impl Simulation {
 
             // 1. Stage Cost (Q) - Massive penalty for Z errors
             self.mpc.q = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 800.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
-                70000.0, 70000.0, 0.0, 0.0,
-                100.0, 100.0, 2000.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
+                300.0, 300.0, 800.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
+                100000.0, 100000.0, 0.0, 0.0,
+                100.0, 100.0, 6000.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
                 500.0, 500.0, 500.0   
             ]));
 
@@ -359,22 +363,23 @@ impl Simulation {
 
             // 3. Terminal Cost (QN) - Land softly!
             self.mpc.qn = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 800.0, 
-                100000.0, 100000.0, 0.0, 0.0,
-                100.0, 100.0, 2000.0, 
+                150.0, 150.0, 50000.0, 
+                120000.0, 120000.0, 0.0, 0.0,
+                100.0, 100.0, 200.0, 
                 1000.0, 1000.0, 1000.0 
             ]));
             self.lossless.lower_thrust_bound = 500.0;
             // self.lossless.flip_glide_slope = false;
             // self.lossless.use_glide_slope = true;
             self.lossless.use_bottom_glide_slope = true;
-            self.lossless.use_top_glide_slope = true;
+            // self.lossless.use_top_glide_slope = true;
+            self.lossless.use_top_glide_slope = false;
             self.lossless.glide_slope = 0.005_f64.to_radians();
             // self.lossless.max_velocity = 5.0;
             // if self.rocket.velocity.norm() >= 5.0 {
             //     self.lossless.max_velocity = self.rocket.velocity.norm() * 1.25;
             // }
-            let trajectory = self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 1.5-1.0], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
+            let trajectory = self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 1.5-0.5], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
             (xref_traj, uref_traj) = self.get_mpc_reference(&trajectory, self.current_time - self.lossless.last_solve_time, self.rocket.attitude, self.mpc.min_thrust, self.mpc.dt, self.lossless.fine_delta_t, self.mpc.n_steps + 1);
             if self.current_time - self.traj_timer > 30.0 {
                 self.traj_stage = -1;
@@ -435,8 +440,8 @@ impl Simulation {
             if t_target >= traj.time_of_flight_s || num_points <= 1 {
                 if num_points <= 1 {
                     // 🚨 TRAJECTORY CRASHED: Fallback to a safe, slow vertical drop
-                    interp_p = [0.0, 0.0, -2.0];
-                    interp_v = [0.0, 0.0, -2.0]; 
+                    interp_p = [0.0, 0.0, 0.0];
+                    interp_v = [0.0, 0.0, 0.0]; 
                     interp_u = [0.0, 0.0, default_thrust];
                 } else {
                     // Normal completion: Extrapolate the final state smoothly!
