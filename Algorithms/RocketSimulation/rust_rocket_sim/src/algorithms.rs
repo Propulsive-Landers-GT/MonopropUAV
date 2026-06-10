@@ -480,9 +480,12 @@ impl Lossless {
 pub struct RcsController {
     pub kp: f64,
     pub kd: f64,
-    pub dead_theta: f64,
-    pub dead_omega: f64,
-    pub threshold: f64,
+    pub dead_theta_enter: f64,
+    pub dead_omega_enter: f64,
+    pub dead_theta_exit: f64,
+    pub dead_omega_exit: f64,
+    pub fire_threshold: f64,
+    pub in_deadband: bool,
     pub current_control: RcsCommand,
     pub cached_control: RcsCommand,
     pub system_time: f64,
@@ -497,13 +500,16 @@ pub struct RcsCommand {
 
 
 impl RcsController {
-    pub fn new(kp: f64, kd: f64, dead_theta: f64, dead_omega: f64, threshold: f64, system_time: f64, refresh_updater: RefreshUpdater) -> Self {
+    pub fn new(kp: f64, kd: f64, dead_theta_enter: f64, dead_omega_enter: f64, dead_theta_exit: f64, dead_omega_exit: f64, fire_threshold: f64, system_time: f64, refresh_updater: RefreshUpdater) -> Self {
         Self{
             kp,
             kd,
-            dead_theta,
-            dead_omega,
-            threshold,
+            dead_theta_enter,
+            dead_omega_enter,
+            dead_theta_exit,
+            dead_omega_exit,
+            fire_threshold,
+            in_deadband: false, // start outside of deadband to allow for initial firing if needed
             current_control: RcsCommand { firing_positive: false, firing_negative: false },
             cached_control: RcsCommand { firing_positive: false, firing_negative: false },
             system_time,
@@ -512,15 +518,17 @@ impl RcsController {
     }
 
     pub fn default() -> Self {
-        let kp = 59.9687;
-        let kd = 11.7118;
-        let dead_theta = 0.025;
-        let dead_omega = 0.08;
-        let threshold = 0.8;
+        let kp = 15.3526;
+        let kd = 9.6944;
+        let dead_theta_enter = 0.025;
+        let dead_omega_enter = 0.08;
+        let dead_theta_exit = 0.055;
+        let dead_omega_exit = 0.35;
+        let fire_threshold = 1.5;
         let system_time = 0.0;
         let refresh_updater = RefreshUpdater::new(0.1, 0.03, 0.0, 0.0);
 
-        Self::new(kp, kd, dead_theta, dead_omega, threshold, system_time, refresh_updater)
+        Self::new(kp, kd, dead_theta_enter, dead_omega_enter, dead_theta_exit, dead_omega_exit, fire_threshold, system_time, refresh_updater)
     }
 
     pub fn update(&mut self, roll_angle: f64, roll_rate: f64, system_time: f64) -> RcsCommand {
@@ -537,22 +545,45 @@ impl RcsController {
         }
     }
 
-    pub fn solve(&self, roll_angle: f64, roll_rate: f64) -> RcsCommand {
-        if roll_angle.abs() < self.dead_theta && roll_rate.abs() < self.dead_omega {
+    pub fn solve(&mut self, roll_angle: f64, roll_rate: f64) -> RcsCommand {
+        if self.in_deadband {
+            if roll_angle.abs() > self.dead_theta_exit
+                || roll_rate.abs() > self.dead_omega_exit
+            {
+                self.in_deadband = false;
+            }
+        } else {
+            if roll_angle.abs() < self.dead_theta_enter
+                && roll_rate.abs() < self.dead_omega_enter
+            {
+                self.in_deadband = true;
+            }
+        }
+
+        if self.in_deadband {
             return RcsCommand {
                 firing_positive: false,
                 firing_negative: false,
             };
         }
 
-        let torque = -self.kp * roll_angle - self.kd * roll_rate;
+        let sv = -self.kp * roll_angle - self.kd * roll_rate;
 
-        if torque > self.threshold {
-            RcsCommand { firing_positive: true,  firing_negative: false }
-        } else if torque < -self.threshold {
-            RcsCommand { firing_positive: false, firing_negative: true  }
+        if sv > self.fire_threshold {
+            RcsCommand {
+                firing_positive: true,
+                firing_negative: false,
+            }
+        } else if sv < -self.fire_threshold {
+            RcsCommand {
+                firing_positive: false,
+                firing_negative: true,
+            }
         } else {
-            RcsCommand { firing_positive: false, firing_negative: false }
+            RcsCommand {
+                firing_positive: false,
+                firing_negative: false,
+            }
         }
     }
 }
