@@ -1,23 +1,17 @@
-//! GPS / local XYZ position EKF with measurement-based velocity for prediction.
-//!
-//! State [x, y, z, vx, vy, vz] — position (m) and velocity (m/s) in a fixed local frame.
-//!
-//! Measurement [x, y, z] from each fix (caller converts geodetic to ENU/NED if needed).
-//!
-
-
 use ndarray::{arr1, Array1, Array2};
 use crate::ekf::model::EKFModel;
+
+pub const DEFAULT_GRAVITY_MS2: f64 = 9.80665;
 
 pub struct GpsModel {
     pub current_time: f64,
     pub previous_time: f64,
     pub delta_time: f64,
-    pub prev_meas: [f64; 3],
-    pub prev_time: f64,
-    pub fix_count: u32,
-    /// GPS finite-difference velocity (m/s)
-    pub v_est: [f64; 3],
+    pub gravity_magnitude: f64,
+    /// Accelerometer sample (m/s², body frame).
+    pub accel_body: [f64; 3],
+    /// Euler angles (rad) from the upstream attitude EKF: roll φ, pitch θ, yaw ψ (ZYX).
+    pub euler: [f64; 3],
 }
 
 impl GpsModel {
@@ -26,11 +20,62 @@ impl GpsModel {
             current_time: -delta_time,
             previous_time: -2.0 * delta_time,
             delta_time,
-            prev_meas: [0.0; 3],
-            prev_time: 0.0,
-            fix_count: 0,
-            v_est: [0.0; 3],
+            gravity_magnitude: DEFAULT_GRAVITY_MS2,
+            accel_body: [0.0; 3],
+            euler: [0.0; 3],
         }
+    }
+
+    fn advance_time(&mut self, time: f64) {
+        self.previous_time = self.current_time;
+        self.current_time = time;
+        let parsed_dt = self.current_time - self.previous_time;
+        if parsed_dt.is_finite() && parsed_dt > 0.0 {
+            self.delta_time = parsed_dt;
+        }
+    }
+
+    /// Refresh IMU and attitude between GPS fixes
+    pub fn set_imu_and_attitude(&mut self, accel_body: [f64; 3], euler_rad: [f64; 3]) {
+        self.accel_body = accel_body;
+        self.euler = euler_rad;
+    }
+
+    /// ZYX rotation matrix `R`: transforms a vector from world to body (`v_body = R * v_world`),
+    /// matching [`crate::models::AttitudeModel`].
+    fn euler_to_rotation_matrix(euler: &Array1<f64>) -> Array2<f64> {
+        let (phi, theta, psi) = (euler[0], euler[1], euler[2]);
+        let (cr, sr) = (phi.cos(), phi.sin());
+        let (cp, sp) = (theta.cos(), theta.sin());
+        let (cy, sy) = (psi.cos(), psi.sin());
+
+        Array2::from_shape_vec(
+            (3, 3),
+            vec![
+                cy * cp,
+                cy * sp * sr - sy * cr,
+                cy * sp * cr + sy * sr,
+                sy * cp,
+                sy * sp * sr + cy * cr,
+                sy * sp * cr - cy * sr,
+                -sp,
+                cp * sr,
+                cp * cr,
+            ],
+        )
+        .expect("rotation matrix shape")
+    }
+
+    /// World-frame linear acceleration (m/s²): `a_w = Rᵀ f_b − [0, 0, g]`.
+    fn world_linear_accel(&self) -> [f64; 3] {
+        let euler = arr1(&self.euler);
+        let r = Self::euler_to_rotation_matrix(&euler);
+        let f_w = r.t().dot(&arr1(&self.accel_body));
+        [
+            f_w[0],
+            f_w[1],
+            f_w[2] - self.gravity_magnitude,
+        ]
     }
 }
 
@@ -39,74 +84,51 @@ impl EKFModel for GpsModel {
         Some(self.delta_time)
     }
 
-    /// `[t, x, y, z]` — positions in meters
+    /// `[t, x, y, z, ax, ay, az, roll, pitch, yaw]`.
     fn parse_data(&mut self, data: &[f64]) -> Array1<f64> {
         assert!(
-            data.len() >= 4,
-            "GpsModel::parse_data: expected at least 4 values [t, x, y, z]"
+            data.len() >= 10,
+            "GpsModel::parse_data: expected at least 10 values [t, x, y, z, ax, ay, az, roll, pitch, yaw]"
         );
 
-        self.previous_time = self.current_time;
-        self.current_time = data[0];
-        let parsed_dt = self.current_time - self.previous_time;
-        if parsed_dt.is_finite() && parsed_dt > 0.0 {
-            self.delta_time = parsed_dt;
-        }
+        self.advance_time(data[0]);
+        self.accel_body = [data[4], data[5], data[6]];
+        self.euler = [data[7], data[8], data[9]];
 
-        let p = [data[1], data[2], data[3]];
-
-        // First two measurements: no motion model from history.
-        if self.fix_count >= 2 {
-            let dt_gps = self.current_time - self.prev_time;
-            if dt_gps.is_finite() && dt_gps > 0.0 {
-                self.v_est = [
-                    (p[0] - self.prev_meas[0]) / dt_gps,
-                    (p[1] - self.prev_meas[1]) / dt_gps,
-                    (p[2] - self.prev_meas[2]) / dt_gps,
-                ];
-            } else {
-                self.v_est = [0.0; 3];
-            }
-        } else {
-            self.v_est = [0.0; 3];
-        }
-
-        self.prev_meas = p;
-        self.prev_time = self.current_time;
-        self.fix_count = self.fix_count.saturating_add(1);
-
-        arr1(&[p[0], p[1], p[2]])
+        arr1(&[data[1], data[2], data[3]])
     }
 
     fn state_transition_function(&self, state: &Array1<f64>, dt: f64) -> Array1<f64> {
         if !dt.is_finite() || dt <= 0.0 {
             return state.clone();
         }
-        let vx = self.v_est[0];
-        let vy = self.v_est[1];
-        let vz = self.v_est[2];
+        let a = self.world_linear_accel();
         arr1(&[
-            state[0] + vx * dt,
-            state[1] + vy * dt,
-            state[2] + vz * dt,
-            vx,
-            vy,
-            vz,
+            state[0] + state[3] * dt + 0.5 * a[0] * dt * dt,
+            state[1] + state[4] * dt + 0.5 * a[1] * dt * dt,
+            state[2] + state[5] * dt + 0.5 * a[2] * dt * dt,
+            state[3] + a[0] * dt,
+            state[4] + a[1] * dt,
+            state[5] + a[2] * dt,
         ])
     }
 
-    /// `v_est` treated as independent of `state` for linearization (known input from GPS history).
-    fn state_transition_jacobian(&self, _state: &Array1<f64>, _dt: f64) -> Array2<f64> {
-        if !_dt.is_finite() || _dt <= 0.0 {
+    fn state_transition_jacobian(&self, _state: &Array1<f64>, dt: f64) -> Array2<f64> {
+        if !dt.is_finite() || dt <= 0.0 {
             return Array2::eye(6);
         }
-        let mut f = Array2::<f64>::zeros((6, 6));
-        for i in 0..3 {
-            f[[i, i]] = 1.0;
-        }
-        // ∂p_next/∂v_state = 0 because we use v_est, not state velocity, for position increment.
-        // ∂v_next/∂v_state = 0 because v_next is set to v_est.
-        f
+        Array2::from_shape_vec(
+            (6, 6),
+            vec![
+                1.0, 0.0, 0.0, dt,  0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0, dt,  0.0,
+                0.0, 0.0, 1.0, 0.0, 0.0, dt,
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+        )
+        .expect("F shape")
     }
 
     fn measurement_prediction_function(&self, state: &Array1<f64>) -> Array1<f64> {
