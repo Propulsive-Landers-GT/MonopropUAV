@@ -1,0 +1,32 @@
+#include <Wire.h>
+#include <ICM42605.h>
+
+ICM42605 imu;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  Wire.setClock(400000); // Fast I2C
+
+  if (imu.begin(Wire, ICM42605::I2C_ADDR_AD0_LOW) != 0) {
+    Serial.println("ICM42605 not found!");
+    while (1);
+  }
+
+  Serial.println("ICM42605 initialized!");
+}
+
+void loop() {
+  imu.accelUpdate();
+  imu.gyroUpdate();
+
+  Serial.print("Accel[g] X: "); Serial.print(imu.accelX());
+  Serial.print(" Y: "); Serial.print(imu.accelY());
+  Serial.print(" Z: "); Serial.println(imu.accelZ());
+
+  Serial.print("Gyro[dps] X: "); Serial.print(imu.gyroX());
+  Serial.print(" Y: "); Serial.print(imu.gyroY());
+  Serial.print(" Z: "); Serial.println(imu.gyroZ());
+
+  delay(500);
+}
