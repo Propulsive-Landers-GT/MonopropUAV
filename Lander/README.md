@@ -104,7 +104,7 @@ The Lander transitions through the following discrete flight phases:
 
 ## Interactive Command Console
 
-The simulation runs a non-blocking console interface. Operators can type the following commands directly into the terminal to transition the flight phase:
+The flight computer binary runs a non-blocking console interface. Operators can type the following commands directly into the terminal to transition the flight phase:
 *   `arm`: Arms the vehicle (Standby $\rightarrow$ Armed).
 *   `disarm`: Disarms the vehicle back to Standby (Armed $\rightarrow$ Standby).
 *   `launch`: Triggers liftoff (Armed $\rightarrow$ Ascent).
@@ -113,13 +113,13 @@ The simulation runs a non-blocking console interface. Operators can type the fol
 
 ## Telemetry Logging (MCAP)
 
-During flight, the computer writes real-time telemetry into `flight_log.mcap` using the standard MCAP robotics container format.
+During flight, the computer writes real-time telemetry into `flight_log_*.mcap` files using the standard MCAP robotics container format.
 *   **JSON Encoding**: Channel schemas are serialized as JSON payloads, natively compatible with visualization software like **Foxglove Studio**.
 *   **Available Channels**:
-    *   `telemetry/sensor_data`: Raw IMU, GPS, UWB, and pressure readings.
-    *   `telemetry/vehicle_state`: Fused position, velocity, attitude (Euler & quaternion), angular velocity, and mass.
-    *   `telemetry/control_output`: Gimbal angles ($\theta, \phi$), thrust (Newtons), and world-frame Cartesian force vector.
-    *   `telemetry/flight_phase`: Current phase transitions and elapsed time.
+    *   `telemetry/sensor_data` (500 Hz): Raw IMU, GPS, UWB, and pressure readings from the VN-200.
+    *   `telemetry/vehicle_state` (500 Hz): Fused position, velocity, attitude (Euler & quaternion), angular velocity, and mass.
+    *   `telemetry/control_output` (50 Hz / Event-driven): Gimbal angles ($\theta, \phi$), thrust (Newtons), and world-frame Cartesian force vector (logged when the NMPC solver executes or zero-thrust update runs).
+    *   `telemetry/flight_phase` (On-transition): Logging entries recorded only on flight phase transition updates to conserve file volume.
 
 ---
 
@@ -129,8 +129,8 @@ During flight, the computer writes real-time telemetry into `flight_log.mcap` us
     ```bash
     cargo build
     ```
-2.  **Run the simulation**:
+2.  **Run the FSM console wrapper**:
     ```bash
     cargo run
     ```
-3.  **Commanding**: Type `arm` followed by `launch` in the terminal to takeoff. 
+3.  **Commanding**: Type `arm` followed by `launch` in the terminal to takeoff.
