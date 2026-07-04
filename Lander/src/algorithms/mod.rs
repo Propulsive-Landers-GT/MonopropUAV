@@ -13,7 +13,7 @@ pub trait GuidancePlanner {
         current_velocity: [f64; 3],
         target_position: [f64; 3],
         propellant_mass: f64,
-    ) -> rust_lossless::TrajectoryResult;
+    ) -> Option<rust_lossless::TrajectoryResult>;
 }
 
 pub trait Controller {

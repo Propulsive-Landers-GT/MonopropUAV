@@ -5,7 +5,7 @@ use mcap::{Writer, records::MessageHeader};
 use crate::state::{SensorData, VehicleState, FlightPhase};
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct VehicleStateLog {
     pub position: [f64; 3],
     pub velocity: [f64; 3],
@@ -16,109 +16,201 @@ pub struct VehicleStateLog {
     pub dry_mass: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct ControlOutputLog {
     pub gimbal_theta: f64,
     pub gimbal_phi: f64,
     pub thrust: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct FlightPhaseLog {
     pub phase: FlightPhase,
     pub time_elapsed_s: f64,
 }
 
+enum LogMessage {
+    Sensor(u64, SensorData),
+    VehicleState(u64, VehicleStateLog),
+    ControlOutput(u64, ControlOutputLog),
+    FlightPhase(u64, FlightPhaseLog),
+    Diagnostics(u64, String),
+}
+
 pub struct McapLogger {
-    writer: Writer<BufWriter<File>>,
-    sensor_channel: u16,
-    state_channel: u16,
-    control_channel: u16,
-    phase_channel: u16,
-    sequence: u32,
+    tx: std::sync::mpsc::Sender<LogMessage>,
+    worker_join_handle: Option<std::thread::JoinHandle<()>>,
     start_time: std::time::Instant,
-    
-    // One-shot warning flags to prevent terminal flooding on logging errors
-    warned_sensor: bool,
-    warned_state: bool,
-    warned_control: bool,
-    warned_phase: bool,
-    
-    // Track previous phase to only log on transitions
     last_logged_phase: Option<FlightPhase>,
 }
 
 impl McapLogger {
     pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = File::create(path)?;
-        let mut writer = Writer::new(BufWriter::new(file))?;
+        let path_str = path.to_string();
+        let (tx, rx) = std::sync::mpsc::channel::<LogMessage>();
         
-        // Document metadata and expected rates for each channel
-        let session_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+        let start_time = std::time::Instant::now();
+        
+        let worker_join_handle = std::thread::spawn(move || {
+            let file = File::create(&path_str).expect("Failed to create MCAP file");
+            let mut writer = Writer::new(BufWriter::new(file)).expect("Failed to create MCAP writer");
+            
+            let session_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
 
-        let mut sensor_metadata = BTreeMap::new();
-        sensor_metadata.insert("sensor/imu_model".to_string(), "VectorNav VN-200".to_string());
-        sensor_metadata.insert("sensor/gps_model".to_string(), "VectorNav VN-200 GNSS".to_string());
-        sensor_metadata.insert("rate".to_string(), "500 Hz (raw telemetry)".to_string());
-        sensor_metadata.insert("session_id".to_string(), session_id.clone());
-        
-        let sensor_channel = writer.add_channel(
-            0,
-            "telemetry/sensor_data",
-            "application/json",
-            &sensor_metadata,
-        )?;
-        
-        let mut state_metadata = BTreeMap::new();
-        state_metadata.insert("rate".to_string(), "500 Hz (fused state estimation)".to_string());
-        state_metadata.insert("session_id".to_string(), session_id.clone());
-        
-        let state_channel = writer.add_channel(
-            0,
-            "telemetry/vehicle_state",
-            "application/json",
-            &state_metadata,
-        )?;
-        
-        let mut control_metadata = BTreeMap::new();
-        control_metadata.insert("rate".to_string(), "50 Hz / Event-driven".to_string());
-        control_metadata.insert("notes".to_string(), "Logged on NMPC solver output or zero-thrust update, not on 500 Hz EKF ticks".to_string());
-        control_metadata.insert("session_id".to_string(), session_id.clone());
-        
-        let control_channel = writer.add_channel(
-            0,
-            "telemetry/control_output",
-            "application/json",
-            &control_metadata,
-        )?;
-        
-        let mut phase_metadata = BTreeMap::new();
-        phase_metadata.insert("rate".to_string(), "On-transition".to_string());
-        phase_metadata.insert("notes".to_string(), "Logged only on flight phase transitions to optimize log file volume".to_string());
-        phase_metadata.insert("session_id".to_string(), session_id.clone());
-        
-        let phase_channel = writer.add_channel(
-            0,
-            "telemetry/flight_phase",
-            "application/json",
-            &phase_metadata,
-        )?;
+            let mut sensor_metadata = BTreeMap::new();
+            sensor_metadata.insert("sensor/imu_model".to_string(), "VectorNav VN-200".to_string());
+            sensor_metadata.insert("sensor/gps_model".to_string(), "VectorNav VN-200 GNSS".to_string());
+            sensor_metadata.insert("rate".to_string(), "500 Hz (raw telemetry)".to_string());
+            sensor_metadata.insert("session_id".to_string(), session_id.clone());
+            
+            let sensor_channel = writer.add_channel(
+                0,
+                "telemetry/sensor_data",
+                "application/json",
+                &sensor_metadata,
+            ).unwrap();
+            
+            let mut state_metadata = BTreeMap::new();
+            state_metadata.insert("rate".to_string(), "500 Hz (fused state estimation)".to_string());
+            state_metadata.insert("session_id".to_string(), session_id.clone());
+            
+            let state_channel = writer.add_channel(
+                0,
+                "telemetry/vehicle_state",
+                "application/json",
+                &state_metadata,
+            ).unwrap();
+            
+            let mut control_metadata = BTreeMap::new();
+            control_metadata.insert("rate".to_string(), "50 Hz / Event-driven".to_string());
+            control_metadata.insert("notes".to_string(), "Logged on NMPC solver output or zero-thrust update, not on 500 Hz EKF ticks".to_string());
+            control_metadata.insert("session_id".to_string(), session_id.clone());
+            
+            let control_channel = writer.add_channel(
+                0,
+                "telemetry/control_output",
+                "application/json",
+                &control_metadata,
+            ).unwrap();
+            
+            let mut phase_metadata = BTreeMap::new();
+            phase_metadata.insert("rate".to_string(), "On-transition".to_string());
+            phase_metadata.insert("notes".to_string(), "Logged only on flight phase transitions to optimize log file volume".to_string());
+            phase_metadata.insert("session_id".to_string(), session_id.clone());
+            
+            let phase_channel = writer.add_channel(
+                0,
+                "telemetry/flight_phase",
+                "application/json",
+                &phase_metadata,
+            ).unwrap();
+            
+            let mut diagnostics_metadata = BTreeMap::new();
+            diagnostics_metadata.insert("rate".to_string(), "Event-driven".to_string());
+            diagnostics_metadata.insert("notes".to_string(), "Logged on FSM state transitions, trajectory updates, solver diagnostic events, and system errors".to_string());
+            diagnostics_metadata.insert("session_id".to_string(), session_id.clone());
+            
+            let diagnostics_channel = writer.add_channel(
+                0,
+                "telemetry/diagnostics",
+                "application/json",
+                &diagnostics_metadata,
+            ).unwrap();
+            
+            let mut sequence = 0u32;
+            
+            // Loop reading from the queue and writing to disk
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    LogMessage::Sensor(timestamp_ns, data) => {
+                        if let Ok(payload) = serde_json::to_vec(&data) {
+                            let _ = writer.write_to_known_channel(
+                                &MessageHeader {
+                                    channel_id: sensor_channel,
+                                    sequence,
+                                    log_time: timestamp_ns,
+                                    publish_time: timestamp_ns,
+                                },
+                                &payload,
+                            );
+                            sequence += 1;
+                        }
+                    }
+                    LogMessage::VehicleState(timestamp_ns, log_data) => {
+                        if let Ok(payload) = serde_json::to_vec(&log_data) {
+                            let _ = writer.write_to_known_channel(
+                                &MessageHeader {
+                                    channel_id: state_channel,
+                                    sequence,
+                                    log_time: timestamp_ns,
+                                    publish_time: timestamp_ns,
+                                },
+                                &payload,
+                            );
+                            sequence += 1;
+                        }
+                    }
+                    LogMessage::ControlOutput(timestamp_ns, log_data) => {
+                        if let Ok(payload) = serde_json::to_vec(&log_data) {
+                            let _ = writer.write_to_known_channel(
+                                &MessageHeader {
+                                    channel_id: control_channel,
+                                    sequence,
+                                    log_time: timestamp_ns,
+                                    publish_time: timestamp_ns,
+                                },
+                                &payload,
+                            );
+                            sequence += 1;
+                        }
+                    }
+                    LogMessage::FlightPhase(timestamp_ns, log_data) => {
+                        if let Ok(payload) = serde_json::to_vec(&log_data) {
+                            let _ = writer.write_to_known_channel(
+                                &MessageHeader {
+                                    channel_id: phase_channel,
+                                    sequence,
+                                    log_time: timestamp_ns,
+                                    publish_time: timestamp_ns,
+                                },
+                                &payload,
+                            );
+                            sequence += 1;
+                        }
+                    }
+                    LogMessage::Diagnostics(timestamp_ns, message) => {
+                        #[derive(Serialize)]
+                        struct DiagnosticsLog {
+                            message: String,
+                        }
+                        let log_data = DiagnosticsLog { message };
+                        if let Ok(payload) = serde_json::to_vec(&log_data) {
+                            let _ = writer.write_to_known_channel(
+                                &MessageHeader {
+                                    channel_id: diagnostics_channel,
+                                    sequence,
+                                    log_time: timestamp_ns,
+                                    publish_time: timestamp_ns,
+                                },
+                                &payload,
+                            );
+                            sequence += 1;
+                        }
+                    }
+                }
+            }
+            
+            // Finalize writing bytes to disk
+            let _ = writer.finish();
+        });
         
         Ok(Self {
-            writer,
-            sensor_channel,
-            state_channel,
-            control_channel,
-            phase_channel,
-            sequence: 0,
-            start_time: std::time::Instant::now(),
-            warned_sensor: false,
-            warned_state: false,
-            warned_control: false,
-            warned_phase: false,
+            tx,
+            worker_join_handle: Some(worker_join_handle),
+            start_time,
             last_logged_phase: None,
         })
     }
@@ -126,28 +218,13 @@ impl McapLogger {
     pub fn get_timestamp_ns(&self) -> u64 {
         self.start_time.elapsed().as_nanos() as u64
     }
+
+    pub fn get_elapsed_seconds(&self) -> f64 {
+        self.start_time.elapsed().as_secs_f64()
+    }
     
     pub fn log_sensor_data(&mut self, timestamp_ns: u64, data: &SensorData) -> Result<(), Box<dyn std::error::Error>> {
-        let payload = serde_json::to_vec(data)?;
-        let result = self.writer.write_to_known_channel(
-            &MessageHeader {
-                channel_id: self.sensor_channel,
-                sequence: self.sequence,
-                log_time: timestamp_ns,
-                publish_time: timestamp_ns,
-            },
-            &payload,
-        );
-        
-        if let Err(ref e) = result {
-            if !self.warned_sensor {
-                eprintln!("[MCAP Logger Error] Failed to write sensor data: {}. Logging for this channel might be lost.", e);
-                self.warned_sensor = true;
-            }
-        }
-        
-        self.sequence += 1;
-        result?;
+        let _ = self.tx.send(LogMessage::Sensor(timestamp_ns, data.clone()));
         Ok(())
     }
     
@@ -164,27 +241,7 @@ impl McapLogger {
             mass: state.mass,
             dry_mass: state.dry_mass,
         };
-        
-        let payload = serde_json::to_vec(&log_data)?;
-        let result = self.writer.write_to_known_channel(
-            &MessageHeader {
-                channel_id: self.state_channel,
-                sequence: self.sequence,
-                log_time: timestamp_ns,
-                publish_time: timestamp_ns,
-            },
-            &payload,
-        );
-        
-        if let Err(ref e) = result {
-            if !self.warned_state {
-                eprintln!("[MCAP Logger Error] Failed to write vehicle state: {}. Logging for this channel might be lost.", e);
-                self.warned_state = true;
-            }
-        }
-        
-        self.sequence += 1;
-        result?;
+        let _ = self.tx.send(LogMessage::VehicleState(timestamp_ns, log_data));
         Ok(())
     }
     
@@ -200,67 +257,33 @@ impl McapLogger {
             gimbal_phi,
             thrust,
         };
-        
-        let payload = serde_json::to_vec(&log_data)?;
-        let result = self.writer.write_to_known_channel(
-            &MessageHeader {
-                channel_id: self.control_channel,
-                sequence: self.sequence,
-                log_time: timestamp_ns,
-                publish_time: timestamp_ns,
-            },
-            &payload,
-        );
-        
-        if let Err(ref e) = result {
-            if !self.warned_control {
-                eprintln!("[MCAP Logger Error] Failed to write control output: {}. Logging for this channel might be lost.", e);
-                self.warned_control = true;
-            }
-        }
-        
-        self.sequence += 1;
-        result?;
+        let _ = self.tx.send(LogMessage::ControlOutput(timestamp_ns, log_data));
         Ok(())
     }
     
     pub fn log_flight_phase(&mut self, timestamp_ns: u64, phase: FlightPhase, time_elapsed_s: f64) -> Result<(), Box<dyn std::error::Error>> {
-        // Only log flight phase changes on transition to prevent spamming
         if Some(phase) != self.last_logged_phase {
+            self.last_logged_phase = Some(phase);
             let log_data = FlightPhaseLog {
                 phase,
                 time_elapsed_s,
             };
-            
-            let payload = serde_json::to_vec(&log_data)?;
-            let result = self.writer.write_to_known_channel(
-                &MessageHeader {
-                    channel_id: self.phase_channel,
-                    sequence: self.sequence,
-                    log_time: timestamp_ns,
-                    publish_time: timestamp_ns,
-                },
-                &payload,
-            );
-            
-            if let Err(ref e) = result {
-                if !self.warned_phase {
-                    eprintln!("[MCAP Logger Error] Failed to write flight phase change: {}. Logging for this channel might be lost.", e);
-                    self.warned_phase = true;
-                }
-            }
-            
-            self.sequence += 1;
-            self.last_logged_phase = Some(phase);
-            result?;
-            
+            let _ = self.tx.send(LogMessage::FlightPhase(timestamp_ns, log_data));
             println!("Logged phase change to MCAP: {:?}", phase);
         }
         Ok(())
     }
     
+    pub fn log_diagnostics(&mut self, timestamp_ns: u64, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self.tx.send(LogMessage::Diagnostics(timestamp_ns, message.to_string()));
+        Ok(())
+    }
+    
     pub fn finish(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.writer.finish()?;
+        drop(self.tx);
+        if let Some(handle) = self.worker_join_handle.take() {
+            handle.join().map_err(|_| "Failed to join logger thread")?;
+        }
         Ok(())
     }
 }

@@ -44,7 +44,7 @@ impl Lossless {
         }
     }
 
-    pub fn solve(&mut self, current_position: [f64; 3], current_velocity: [f64; 3], target_position: [f64; 3], propellant_mass: f64) -> rust_lossless::TrajectoryResult {
+    pub fn solve(&mut self, current_position: [f64; 3], current_velocity: [f64; 3], target_position: [f64; 3], propellant_mass: f64) -> Option<rust_lossless::TrajectoryResult> {
         let mut solver = rust_lossless::LosslessSolver {
             landing_point: target_position,
             initial_position: current_position,
@@ -58,31 +58,20 @@ impl Lossless {
             tvc_range_rad: self.tvc_range_rad,
             coarse_delta_t: self.coarse_delta_t,
             fine_delta_t: self.fine_delta_t,
-            use_glide_slope: self.use_glide_slope,
+            use_bottom_glide_slope: self.use_glide_slope,
+            use_top_glide_slope: self.use_glide_slope,
             glide_slope: self.glide_slope,
             N: 20,
             ..Default::default()
         };
 
         let result = solver.solve();
-
-        if let Some(trajectory) = result.trajectory {
-            trajectory
-        } else {
-            rust_lossless::TrajectoryResult {
-                positions: vec![current_position],
-                velocities: vec![current_velocity],
-                masses: vec![self.dry_mass + propellant_mass],
-                thrusts: vec![[0.0, 0.0, (self.dry_mass + propellant_mass) * 9.81]],
-                sigmas: vec![0.0],
-                time_of_flight_s: 0.1,
-            }
-        }
+        result.trajectory
     }
 }
 
 impl GuidancePlanner for Lossless {
-    fn solve(&mut self, current_position: [f64; 3], current_velocity: [f64; 3], target_position: [f64; 3], propellant_mass: f64) -> rust_lossless::TrajectoryResult {
+    fn solve(&mut self, current_position: [f64; 3], current_velocity: [f64; 3], target_position: [f64; 3], propellant_mass: f64) -> Option<rust_lossless::TrajectoryResult> {
         self.solve(current_position, current_velocity, target_position, propellant_mass)
     }
 }

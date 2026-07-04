@@ -43,8 +43,12 @@ impl ESEKFModel for RocketState {
         let next_quat = quat * q_update; // Post-multiply for local frame rotation
 
         // Update state array
-        next_state[0..3].copy_from_slice(next_pos.as_slice());
-        next_state[3..6].copy_from_slice(next_vel.as_slice());
+        next_state[0] = next_pos.x;
+        next_state[1] = next_pos.y;
+        next_state[2] = next_pos.z;
+        next_state[3] = next_vel.x;
+        next_state[4] = next_vel.y;
+        next_state[5] = next_vel.z;
         next_state[6] = next_quat.w;
         next_state[7] = next_quat.i;
         next_state[8] = next_quat.j;
@@ -55,7 +59,7 @@ impl ESEKFModel for RocketState {
     }
 
     /// Error Jacobian F (15x15)
-    fn error_transition_jacobian(&self, state: &Array1<f64>, imu: &[f64], dt: f64) -> Array2<f64> {
+    fn error_transition_jacobian(&self, _state: &Array1<f64>, _imu: &[f64], dt: f64) -> Array2<f64> {
         let mut f = Array2::<f64>::eye(15);
         
         // This is a simplified placeholder. In reality, you must compute the derivatives 
@@ -105,7 +109,7 @@ impl ESEKFModel for RocketState {
         let q_err = Quaternion::new(1.0, half_dtheta.x, half_dtheta.y, half_dtheta.z);
         
         // Normalize the error quaternion (handles cases where error is slightly large)
-        let q_err_unit = UnitQuaternion::from_quaternion(q_err).normalize();
+        let q_err_unit = UnitQuaternion::new_normalize(q_err);
 
         // Apply error rotation to nominal
         let q_corrected = q_nom * q_err_unit;

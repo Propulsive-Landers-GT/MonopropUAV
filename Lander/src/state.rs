@@ -69,6 +69,8 @@ pub struct ControlLoopState {
     pub last_gimbal_phi: f64,
     pub last_thrust: f64,
     pub mass: f64,
+    pub termination_reason: Option<String>,
+    pub diagnostics_queue: Vec<String>,
 }
 
 impl Default for ControlLoopState {
@@ -90,6 +92,8 @@ impl Default for ControlLoopState {
             last_gimbal_phi: 0.0,
             last_thrust: 80.0 * 9.81,
             mass: 80.0,
+            termination_reason: None,
+            diagnostics_queue: Vec::new(),
         }
     }
 }

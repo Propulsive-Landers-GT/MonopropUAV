@@ -124,7 +124,7 @@ impl MPC {
         let thrust_min = 300.0;
         let thrust_max = self.max_thrust;
         
-        let (_u_apply, u_warm_seq) = mpc_crate::OpEnSolve(
+        let (_u_apply, u_warm_seq, _debug_info) = mpc_crate::OpEnSolve(
             current_state,
             &u_warm,
             reference_trajectory,
@@ -141,7 +141,7 @@ impl MPC {
             self.dt,
         );
         
-        let mut u_opt_vec = Vec::new();
+        let mut u_opt_vec: Vec<Array1<f64>> = Vec::new();
         for row in u_warm_seq.axis_iter(ndarray::Axis(0)) {
             u_opt_vec.push(row.to_owned());
         }

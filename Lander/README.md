@@ -5,8 +5,8 @@ This directory contains the flight control loop, sensor fusion, and guidance alg
 ## Software Architecture
 
 The flight software operates a multi-rate control loop:
-*   **Sensor Fusion (500 Hz)**: Collects telemetry from the onboard sensors and updates a 12-state Unified Extended Kalman Filter (EKF) to estimate position, velocity, attitude (Euler angles/quaternion), and gyroscope biases.
-*   **Guidance & Navigation (1 Hz)**: Operates a phase-aware trajectory planner. It dynamically computes fuel-optimal paths to the hover and landing targets using a Lossless Convexification solver (powered by the `Clarabel` SOCP solver).
+*   **Sensor Fusion (500 Hz)**: Collects telemetry from the onboard sensors and updates a 16-state Error-State Kalman Filter (ES-EKF) to estimate position, velocity, attitude (quaternion), and sensor biases (accelerometer and gyroscope biases).
+*   **Guidance & Navigation (1 Hz)**: Operates a phase-aware closed-loop trajectory planner. It dynamically re-plans optimal paths to the hover and landing targets at 1 Hz from the current EKF-estimated state. If the solver fails, the system falls back to tracking the last valid trajectory.
 *   **Control Loop (50 Hz)**: Uses a real-time Non-linear Model Predictive Controller (NMPC) powered by the PANOC solver (`optimization_engine`) to track the reference trajectory.
 
 ```
@@ -88,7 +88,7 @@ The Lander transitions through the following discrete flight phases:
 3.  **`Ascent`**: Thrust is active. The vehicle climbs to the target altitude (50m) tracking the lossless convex trajectory.
 4.  **`Hover`**: Triggered when altitude reaches 95% of target (47.5m). Holds position for 20 seconds.
 5.  **`Descent`**: Triggers a guided descent trajectory using the Lossless solver to perform a controlled decelerating landing.
-6.  **`Landed`**: Touchdown detected ($z \le 0$). Thrust is disabled, controls zeroed, and logging is finalized.
+6.  **`Landed`**: Touchdown detected (altitude z <= 0.1m and estimated speed ||v|| < 0.2m/s). Thrust is disabled, controls zeroed, and logging is finalized.
 
 ---
 
@@ -114,12 +114,14 @@ The flight computer binary runs a non-blocking console interface. Operators can 
 ## Telemetry Logging (MCAP)
 
 During flight, the computer writes real-time telemetry into `flight_log_*.mcap` files using the standard MCAP robotics container format.
+*   **Asynchronous Logging**: To eliminate real-time scheduler jitter, serialization and disk writes run on a dedicated worker thread decoupled from the 500 Hz control loop via a lock-free channel.
 *   **JSON Encoding**: Channel schemas are serialized as JSON payloads, natively compatible with visualization software like **Foxglove Studio**.
 *   **Available Channels**:
     *   `telemetry/sensor_data` (500 Hz): Raw IMU, GPS, UWB, and pressure readings from the VN-200.
     *   `telemetry/vehicle_state` (500 Hz): Fused position, velocity, attitude (Euler & quaternion), angular velocity, and mass.
     *   `telemetry/control_output` (50 Hz / Event-driven): Gimbal angles ($\theta, \phi$), thrust (Newtons), and world-frame Cartesian force vector (logged when the NMPC solver executes or zero-thrust update runs).
     *   `telemetry/flight_phase` (On-transition): Logging entries recorded only on flight phase transition updates to conserve file volume.
+    *   `telemetry/diagnostics` (Event-driven): Logging entries recorded on phase transitions, solver alerts, re-planning success/fallbacks, and flight termination causes.
 
 ---
 

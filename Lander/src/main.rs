@@ -45,10 +45,10 @@ fn main() {
     
     let mut last_print_second = -1;
     let mut mission_time = 0.0;
-    let dt = 0.002; // 500 Hz
 
     loop {
         let timestamp_ns = mcap_logger.get_timestamp_ns();
+        mission_time = mcap_logger.get_elapsed_seconds();
 
         // Check for stdin commands
         if let Ok(cmd) = stdin_rx.try_recv() {
@@ -78,12 +78,26 @@ fn main() {
         let _ = mcap_logger.log_sensor_data(timestamp_ns, &sensor_data);
         
         // Step the flight state machine
-        if let Some(control_output) = fsm.step(&sensor_data) {
-            if fsm.get_state().flight_terminated {
-                println!("Flight terminated - zeroing controls");
-                break;
-            }
+        let control_output_opt = fsm.step(&sensor_data);
+        
+        // Drain and log FSM diagnostic messages
+        for msg in fsm.get_state_mut().diagnostics_queue.drain(..) {
+            let _ = mcap_logger.log_diagnostics(timestamp_ns, &msg);
+        }
+        
+        if fsm.get_state().flight_terminated {
+            let reason = fsm.get_state().termination_reason.clone().unwrap_or_else(|| "Unknown".to_string());
+            let msg = format!("Flight terminated - zeroing controls. Reason: {}", reason);
+            println!("{}", msg);
+            let _ = mcap_logger.log_diagnostics(timestamp_ns, &msg);
             
+            // Log final vehicle state and flight phase
+            let _ = mcap_logger.log_vehicle_state(timestamp_ns, &fsm.get_state().vehicle_state);
+            let _ = mcap_logger.log_flight_phase(timestamp_ns, fsm.get_state().flight_phase, mission_time);
+            break;
+        }
+        
+        if let Some(control_output) = control_output_opt {
             // Log control output (gimbal_theta, gimbal_phi, thrust)
             let _ = mcap_logger.log_control_output(
                 timestamp_ns,
@@ -112,11 +126,9 @@ fn main() {
         
         if fsm.get_state().flight_phase == state::FlightPhase::Landed {
             println!("Landed successfully at {:.2}m altitude!", fsm.get_state().vehicle_state.position.z);
+            let _ = mcap_logger.log_diagnostics(timestamp_ns, "Landed successfully!");
             break;
         }
-        
-        // Accumulate mission clock
-        mission_time += dt;
         
         // Sleep to maintain EKF / loop rate at 500 Hz
         std::thread::sleep(std::time::Duration::from_millis(2));

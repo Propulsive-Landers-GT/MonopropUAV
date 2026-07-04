@@ -102,8 +102,17 @@ impl FlightStateMachine {
         }
     }
     
+    #[inline]
+    fn due(last: f64, now: f64, rate: f64) -> bool {
+        now - last >= (1.0 / rate) - 1e-6
+    }
+
     pub fn get_state(&self) -> &ControlLoopState {
         &self.state
+    }
+
+    pub fn get_state_mut(&mut self) -> &mut ControlLoopState {
+        &mut self.state
     }
     
     pub fn step(&mut self, sensor_data: &SensorData) -> Option<[f64; 3]> {
@@ -112,51 +121,63 @@ impl FlightStateMachine {
         }
         
         let now = sensor_data.timestamp;
+
+        // Centralized scheduling for Sensor Fusion (500 Hz)
+        let sensor_fusion_due = Self::due(self.state.last_sensor_update, now, self.sensor_fusion_rate);
+        let sensor_dt = if self.state.last_sensor_update > 0.0 {
+            now - self.state.last_sensor_update
+        } else {
+            1.0 / self.sensor_fusion_rate
+        };
+
+        if sensor_fusion_due {
+            self.update_sensor_fusion(sensor_data, now, sensor_dt);
+        }
         
-        // Mass depletion model (based on last_thrust from operator / MPC)
+        // Mass depletion model (based on last_thrust from operator / MPC and actual elapsed sensor_dt)
         if self.state.flight_phase == FlightPhase::Standby || self.state.flight_phase == FlightPhase::Armed {
             self.state.mass = 80.0;
-        } else if self.state.flight_phase != FlightPhase::Landed {
-            let dt = 0.002;
-            
-            // TODO: Implement a gain table for more accurate mass estimation as propellant depletes
+        } else if self.state.flight_phase != FlightPhase::Landed && sensor_fusion_due {
+            // TODO: Implement a more accurate mass estimation model as propellant depletes
             let mass_flow = self.state.last_thrust / (180.0 * 9.81);
             
             // TODO: Map chamber pressure to thrust ratio (thrust = chamber_pressure * K_thrust) to verify actuator telemetry
-            self.state.mass -= mass_flow * dt;
+            self.state.mass -= mass_flow * sensor_dt;
             self.state.mass = self.state.mass.max(50.0);
         }
         
-        if self.check_flight_termination(sensor_data, now) {
+        // Run termination check on the freshest state (after sensor fusion update)
+        if let Some(reason) = self.check_flight_termination(sensor_data, now) {
             self.state.flight_terminated = true;
-            println!("Flight terminated!");
+            self.state.termination_reason = Some(reason.clone());
+            self.state.diagnostics_queue.push(format!("Flight terminated! Reason: {}", reason));
+            println!("Flight terminated! Reason: {}", reason);
             return None;
         }
         
-        // Centralized scheduling for Sensor Fusion (500 Hz)
-        if now - self.state.last_sensor_update >= (1.0 / self.sensor_fusion_rate) - 1e-6 {
-            self.update_sensor_fusion(sensor_data, now);
-        }
-
+        let old_phase = self.state.flight_phase;
         self.state.flight_phase = self.determine_flight_phase(self.goal, now);
+        if self.state.flight_phase != old_phase {
+            self.state.diagnostics_queue.push(format!("Flight phase transition: {:?} -> {:?}", old_phase, self.state.flight_phase));
+        }
         
         // Centralized scheduling for Navigation planner (1 Hz)
-        if now - self.state.last_navigation_update >= (1.0 / self.navigation_rate) - 1e-6 {
+        if Self::due(self.state.last_navigation_update, now, self.navigation_rate) {
             self.update_navigation(now);
         }
         
         // Centralized scheduling for MPC (50 Hz)
         if self.state.flight_phase == FlightPhase::Standby || self.state.flight_phase == FlightPhase::Armed || self.state.flight_phase == FlightPhase::Landed {
-            if now - self.state.last_mpc_update >= (1.0 / self.mpc_rate) - 1e-6 {
+            if Self::due(self.state.last_mpc_update, now, self.mpc_rate) {
                 self.state.last_mpc_update = now;
                 return Some([0.0, 0.0, 0.0]); // zero gimbal/thrust
             }
             return None;
         }
         
-        if now - self.state.last_mpc_update >= (1.0 / self.mpc_rate) - 1e-6 {
+        if Self::due(self.state.last_mpc_update, now, self.mpc_rate) {
+            self.state.last_mpc_update = now;
             if let Some(control_output) = self.update_mpc(now) {
-                self.state.last_mpc_update = now;
                 return Some(control_output);
             }
         }
@@ -164,9 +185,9 @@ impl FlightStateMachine {
         None
     }
     
-    fn update_sensor_fusion(&mut self, sensor_data: &SensorData, now: f64) -> bool {
+    fn update_sensor_fusion(&mut self, sensor_data: &SensorData, now: f64, dt: f64) -> bool {
         let in_prelaunch = self.state.flight_phase == FlightPhase::Standby || self.state.flight_phase == FlightPhase::Armed;
-        if let Some(mut updated_state) = self.sensor_fusion.update(sensor_data, 0.002, in_prelaunch) {
+        if let Some(mut updated_state) = self.sensor_fusion.update(sensor_data, dt, in_prelaunch) {
             updated_state.mass = self.state.mass;
             self.state.sensor_fusion_state = self.sensor_fusion.get_state_vector();
             self.state.vehicle_state = updated_state;
@@ -282,7 +303,9 @@ impl FlightStateMachine {
                 }
             },
             FlightPhase::Descent => {
-                if self.state.vehicle_state.position.z <= 0.0 {
+                let v = &self.state.vehicle_state.velocity;
+                let speed = (v.x.powi(2) + v.y.powi(2) + v.z.powi(2)).sqrt();
+                if current_altitude <= 0.1 && speed < 0.2 {
                     FlightPhase::Landed
                 } else {
                     FlightPhase::Descent
@@ -300,16 +323,22 @@ impl FlightStateMachine {
         let goal_position = self.goal;
         let propellant_mass = self.state.mass - self.state.vehicle_state.dry_mass;
         
-        let trajectory = self.guidance.solve(
+        if let Some(trajectory) = self.guidance.solve(
             [current_pos.x, current_pos.y, current_pos.z],
             [current_vel.x, current_vel.y, current_vel.z],
             goal_position,
             propellant_mass
-        );
-        
-        self.state.trajectory_state = Some(trajectory.clone());
-        self.state.trajectory_generation_time = now;
-        println!("Ascent trajectory generated: {:.2}s flight time", trajectory.time_of_flight_s);
+        ) {
+            self.state.trajectory_state = Some(trajectory.clone());
+            self.state.trajectory_generation_time = now;
+            let msg = format!("Ascent trajectory regenerated: {:.2}s flight time", trajectory.time_of_flight_s);
+            println!("{}", msg);
+            self.state.diagnostics_queue.push(msg);
+        } else {
+            let msg = "Warning: Ascent trajectory regeneration failed! Falling back to last valid trajectory.".to_string();
+            println!("{}", msg);
+            self.state.diagnostics_queue.push(msg);
+        }
     }
     
     fn generate_descent_trajectory(&mut self, now: f64) {
@@ -318,42 +347,44 @@ impl FlightStateMachine {
         let landing_point = [0.0, 0.0, 0.0];
         let propellant_mass = self.state.mass - self.state.vehicle_state.dry_mass;
         
-        let trajectory = self.guidance.solve(
+        if let Some(trajectory) = self.guidance.solve(
             [current_pos.x, current_pos.y, current_pos.z],
             [current_vel.x, current_vel.y, current_vel.z],
             landing_point,
             propellant_mass
-        );
-        
-        self.state.trajectory_state = Some(trajectory.clone());
-        self.state.trajectory_generation_time = now;
-        println!("Descent trajectory generated: {:.2}s flight time", trajectory.time_of_flight_s);
+        ) {
+            self.state.trajectory_state = Some(trajectory.clone());
+            self.state.trajectory_generation_time = now;
+            let msg = format!("Descent trajectory regenerated: {:.2}s flight time", trajectory.time_of_flight_s);
+            println!("{}", msg);
+            self.state.diagnostics_queue.push(msg);
+        } else {
+            let msg = "Warning: Descent trajectory regeneration failed! Falling back to last valid trajectory.".to_string();
+            println!("{}", msg);
+            self.state.diagnostics_queue.push(msg);
+        }
     }
     
-    fn check_flight_termination(&self, sensor_data: &SensorData, now: f64) -> bool {
+    fn check_flight_termination(&self, sensor_data: &SensorData, now: f64) -> Option<String> {
         if sensor_data.imu_data.is_none() {
-            println!("Flight Terminated: IMU data missing!");
-            return true;
+            return Some("IMU data missing".to_string());
         }
         
         if sensor_data.uwb_data.is_none() && sensor_data.gps_data.is_none() {
             let elapsed_since_pos = now - self.state.last_position_update;
             if elapsed_since_pos > 5.0 {
-                println!("Flight Terminated: No GPS or UWB position data for {:.2}s!", elapsed_since_pos);
-                return true;
+                return Some(format!("No GPS or UWB position data for {:.2}s", elapsed_since_pos));
             }
         }
         
         if sensor_data.chamber_pressure.is_none() || sensor_data.tank_pressure.is_none() {
-            println!("Flight Terminated: Pressure data missing!");
-            return true;
+            return Some("Pressure data missing".to_string());
         }
         
         let euler_attitude = self.state.vehicle_state.attitude.euler_angles();
         let tilt_angle = euler_attitude.0.abs();
         if tilt_angle > 30.0_f64.to_radians() {
-            println!("Flight Terminated: Tilt angle {:.2} deg exceeds maximum (30 deg)!", tilt_angle.to_degrees());
-            return true;
+            return Some(format!("Tilt angle {:.2} deg exceeds maximum (30 deg)", tilt_angle.to_degrees()));
         }
         
         if let Some(ref trajectory) = self.state.trajectory_state {
@@ -367,13 +398,12 @@ impl FlightStateMachine {
                     min_dist = dist;
                 }
             }
-            if min_dist > 10.0 && min_dist < 1e6 {
-                println!("Flight Terminated: Deviation from trajectory {:.2}m exceeds 10m limit!", min_dist);
-                return true;
+            if !trajectory.positions.is_empty() && min_dist > 10.0 {
+                return Some(format!("Deviation from trajectory {:.2}m exceeds 10m limit", min_dist));
             }
         }
         
-        false
+        None
     }
     
     fn vehicle_state_to_mpc_state(&self) -> Array1<f64> {
@@ -420,27 +450,39 @@ impl FlightStateMachine {
                 }
             } else {
                 let traj_dt = if trajectory.positions.len() > 1 {
-                    trajectory.time_of_flight_s / (trajectory.positions.len() - 1) as f64
+                    (trajectory.time_of_flight_s / (trajectory.positions.len() - 1) as f64).max(1e-4)
                 } else {
                     0.1
                 };
                 let exact_idx = t_target / traj_dt;
                 let base_idx = exact_idx.floor() as usize;
-                let safe_idx = base_idx.min(trajectory.positions.len().saturating_sub(2));
-                let clamped_frac = (exact_idx - safe_idx as f64).clamp(0.0, 1.0);
                 
-                let p0 = trajectory.positions[safe_idx];
-                let p1 = trajectory.positions[safe_idx + 1];
-                let v0 = if safe_idx < trajectory.velocities.len() { trajectory.velocities[safe_idx] } else { [0.0, 0.0, 0.0] };
-                let v1 = if safe_idx + 1 < trajectory.velocities.len() { trajectory.velocities[safe_idx + 1] } else { [0.0, 0.0, 0.0] };
-                
-                for j in 0..3 {
-                    interp_p[j] = p0[j] + clamped_frac * (p1[j] - p0[j]);
-                    interp_v[j] = v0[j] + clamped_frac * (v1[j] - v0[j]);
+                if trajectory.positions.len() < 2 {
+                    if let Some(&pos) = trajectory.positions.first() {
+                        interp_p = pos;
+                        interp_v = [0.0, 0.0, 0.0];
+                    }
+                } else {
+                    let safe_idx = base_idx.min(trajectory.positions.len() - 2);
+                    let clamped_frac = (exact_idx - safe_idx as f64).clamp(0.0, 1.0);
+                    
+                    let p0 = trajectory.positions[safe_idx];
+                    let p1 = trajectory.positions[safe_idx + 1];
+                    let v0 = if safe_idx < trajectory.velocities.len() { trajectory.velocities[safe_idx] } else { [0.0, 0.0, 0.0] };
+                    let v1 = if safe_idx + 1 < trajectory.velocities.len() { trajectory.velocities[safe_idx + 1] } else { [0.0, 0.0, 0.0] };
+                    
+                    for j in 0..3 {
+                        interp_p[j] = p0[j] + clamped_frac * (p1[j] - p0[j]);
+                        interp_v[j] = v0[j] + clamped_frac * (v1[j] - v0[j]);
+                    }
                 }
                 
                 let thrust_idx = base_idx.min(trajectory.thrusts.len().saturating_sub(1));
-                interp_u = trajectory.thrusts[thrust_idx];
+                if thrust_idx < trajectory.thrusts.len() {
+                    interp_u = trajectory.thrusts[thrust_idx];
+                } else {
+                    interp_u = [0.0, 0.0, self.state.mass * 9.81];
+                }
             }
             
             let xref = Array1::from(vec![
