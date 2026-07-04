@@ -1,6 +1,88 @@
 use nalgebra::{Vector3, UnitQuaternion};
 use rand::prelude::*;
 use rand_distr::{Normal, Distribution};
+use crate::fluid_dynamics::*;
+
+#[derive(Debug, Clone)]
+pub struct RefreshUpdater {
+    pub overhead: f64, // overhead on startup of process, in seconds
+    pub overhead_sigma: f64, // standard deviation of overhead, in seconds
+    pub iteration_time: f64, // time each iteration takes, in seconds
+    pub iteration_sigma: f64, // standard deviation of iteration time, in seconds
+    pub iterations: f64,
+    pub start_time: f64,
+    current_overhead: f64,
+    current_total_iteration_time: f64,
+}
+
+impl RefreshUpdater {
+    pub fn new(overhead: f64, overhead_sigma: f64, iteration_time: f64, iteration_sigma: f64) -> Self {
+        let mut refresh_updater = Self {
+            overhead,
+            overhead_sigma,
+            iteration_time,
+            iteration_sigma,
+            iterations: 1.0,
+            start_time: 0.0,
+            current_overhead: overhead,
+            current_total_iteration_time: iteration_time,
+        };
+
+        refresh_updater.reset(1.0, 0.0);
+
+        refresh_updater
+    }
+
+    pub fn reset(&mut self, iterations: f64, system_time: f64) {
+        self.iterations = iterations;
+        self.start_time = system_time;
+
+        let mut rng = rand::rng();
+        self.current_overhead = self.overhead + noise_1_d(self.overhead_sigma, &mut rng);
+        self.current_total_iteration_time = self.iteration_time * self.iterations + noise_1_d(self.iteration_sigma * (self.iterations as f64).sqrt(), &mut rng);
+    }
+
+    pub fn update(&mut self, system_time: f64) -> bool {
+        if system_time - self.start_time > self.current_overhead + self.current_total_iteration_time {
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+/// A simple on/off valve used throughout the propellant feed system.
+/// These model actuated valves (solenoid or pneumatic) that are either
+/// fully open or fully closed — no partial opening or transition dynamics.
+///
+/// Valves in the system:
+///   - fill_mv : Fill valve (entry to lander tanks, irrelevant in flight)
+///   - r_mv    : Regulator isolation valve (N2 storage → N2O run tank)
+///   - rcs1_mv : RCS thruster pair 1 (controls one roll direction)
+///   - rcs2_mv : RCS thruster pair 2 (controls opposite roll direction)
+///   - o_iso   : Oxidizer isolation valve (N2O run tank → MTV/engine)
+///   - o_vnt   : Oxidizer vent valve (relieves run tank pressure)
+///
+/// TODO: Consider integrating valve commands into the control_input vector
+///       when we want the GNC algorithms to drive these valves directly.
+#[derive(Debug, Clone)]
+pub struct Valve {
+    pub is_open: bool,
+}
+
+impl Valve {
+    pub fn new(is_open: bool) -> Self {
+        Self { is_open }
+    }
+
+    pub fn open(&mut self) {
+        self.is_open = true;
+    }
+
+    pub fn close(&mut self) {
+        self.is_open = false;
+    }
+}
 
 
 /*
@@ -344,23 +426,19 @@ pub struct MTV {
 
     pub valve_torque: f64,
 
-    starting_fuel_grain_mass: f64,
-
     pub update_rate: f64,
     system_time: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct MTVEffect {
-    pub nitrogen_mass: f64,
-    pub pressurizing_nitrogen_mass: f64,
-    pub nitrous_mass: f64,
-    pub fuel_grain_mass: f64,
-    pub thrust: Vector3<f64>,
+    pub angle: f64,
+    pub ang_vel: f64,
+    pub ang_accel: f64,
 }
 
 impl MTV {
-    pub fn new(angle: f64, ang_vel: f64, ang_accel: f64, unloaded_speed: f64, stall_torque: f64, p_gain: f64, valve_torque: f64, starting_fuel_grain_mass: f64, update_rate: f64) -> Self {
+    pub fn new(angle: f64, ang_vel: f64, ang_accel: f64, unloaded_speed: f64, stall_torque: f64, p_gain: f64, valve_torque: f64, update_rate: f64) -> Self {
         Self {
             angle,
             ang_vel,
@@ -369,13 +447,12 @@ impl MTV {
             stall_torque,
             p_gain,
             valve_torque,
-            starting_fuel_grain_mass,
             update_rate,
             system_time: 0.0,
         }
     }
 
-    pub fn default(starting_fuel_grain_mass: f64) -> Self {
+    pub fn default() -> Self {
         let mtv_angle = 60.0;
         let mtv_ang_vel = 0.0;
         let mtv_ang_accel = 0.0;
@@ -385,10 +462,10 @@ impl MTV {
         let mtv_valve_torque = 30.0;
         let mtv_update_rate = 200.0;
 
-        Self::new(mtv_angle, mtv_ang_vel, mtv_ang_accel, mtv_unloaded_speed, mtv_stall_torque, mtv_p_gain, mtv_valve_torque, starting_fuel_grain_mass, mtv_update_rate)
+        Self::new(mtv_angle, mtv_ang_vel, mtv_ang_accel, mtv_unloaded_speed, mtv_stall_torque, mtv_p_gain, mtv_valve_torque, mtv_update_rate)
     }
 
-    pub fn update(&mut self, target_thrust: f64, nitrogen_mass: f64, pressurizing_nitrogen_mass: f64, nitrous_mass: f64, fuel_grain_mass: f64, dt: f64, system_time: f64) -> MTVEffect {
+    pub fn update(&mut self, target_thrust: f64, thermo_fluid_solver: &mut ThermoFluidSolver, dt: f64, system_time: f64) -> MTVEffect {
         let elapsed_time = system_time - self.system_time;
         if elapsed_time < 1.0 / self.update_rate {
             // angular velocity stays constant, therefore angular acceleration is zero, but angle does update
@@ -399,8 +476,9 @@ impl MTV {
 
             self.system_time = system_time;
 
-            let target_angle = self.get_target_angle(target_thrust);
-            self.angle = target_angle; // TODO: For now, we will assume the MTV can achieve the target angle within one time step. Replace with actual dynamics later.
+            // let target_angle = self.get_target_angle(target_thrust);
+            let target_angle = thermo_fluid_solver.thrust_to_valve_angle(target_thrust, dt).unwrap_or(0.0);
+            // self.angle = target_angle; // TODO: For now, we will assume the MTV can achieve the target angle within one time step. Replace with actual dynamics later.
 
             let error = target_angle - self.angle;
             let command = error * self.p_gain;
@@ -415,11 +493,16 @@ impl MTV {
             self.angle = nalgebra::clamp(self.angle, 0.0, 90.0);
         }
 
-        let mtv_effect = self.get_thrust(nitrogen_mass, pressurizing_nitrogen_mass, nitrous_mass, fuel_grain_mass, dt);
+        let mtv_effect = MTVEffect {
+            angle: self.angle,
+            ang_vel: self.ang_vel,
+            ang_accel: self.ang_accel,
+        };
 
         return mtv_effect;
     }
 
+    // Likely not needed anymore as we are using the thermo-fluid solver for this, could possibly implement some noise?
     pub fn get_target_angle(&mut self, target_thrust: f64) -> f64 {
         // TODO: implement target angle calculation based on thrust
         
@@ -428,47 +511,6 @@ impl MTV {
         let target_angle = 90.0 * (0.1 * ((target_thrust - 300.0) / 300.0).exp() - 0.05);
         println!("Target Thrust: {}, Target Angle: {}", target_thrust, target_angle);
         target_angle
-    }
-
-    pub fn get_thrust(&mut self, nitrogen_mass:f64, pressurizing_nitrogen_mass: f64, nitrous_mass: f64, fuel_grain_mass: f64, dt: f64) -> MTVEffect {
-        // TODO: update the nitrogen, nitrous, and fuel grain masses (nitrogen is used to pressurize the tank, so nitrogen will flow out of the nitrogen tank into the nitrous tank)
-        // TODO: use the current throttle angle to find the flow rate, then determine thrust
-        // Remember to take into account either mass running out
-        // TODO: also model the thrust decay somehow?
-
-        if nitrous_mass <= 0.0 || fuel_grain_mass <= 0.0 {
-            return MTVEffect {
-                nitrogen_mass,
-                pressurizing_nitrogen_mass,
-                nitrous_mass,
-                fuel_grain_mass,
-                thrust: Vector3::zeros(),
-            };
-        }
-
-        // y = 300 * ln((x + 0.05) / 0.1) + 300 is an example thrust curve. Replace later with true relation
-        let thrust = 300.0 * ((self.angle / 90.0 + 0.05) / 0.1).ln() + 300.0;
-        println!("MTV Angle: {}, Thrust: {}", self.angle, thrust);
-        // let nitrous_alpha = 1.0/(9.81 * 180.0);
-        // let nitrogen_alpha = 1.0/(9.81 * 180.0);
-        // let fuel_grain_alpha = 1.0/(9.81 * 180.0);
-        let nitrous_alpha = 0.0;
-        let nitrogen_alpha = 0.0;
-        let fuel_grain_alpha = 0.0;
-
-        let new_nitrogen_mass = (nitrogen_mass - nitrogen_alpha * thrust * dt).max(0.0);
-        let new_pressurizing_nitrogen_mass = (pressurizing_nitrogen_mass + nitrogen_alpha * thrust * dt).max(0.0);
-        let new_nitrous_mass = (nitrous_mass - nitrous_alpha * thrust * dt).max(0.0);
-        let new_fuel_grain_mass = (fuel_grain_mass - fuel_grain_alpha * thrust * dt).max(0.0);
-
-
-        MTVEffect {
-            nitrogen_mass: new_nitrogen_mass,
-            pressurizing_nitrogen_mass: new_pressurizing_nitrogen_mass,
-            nitrous_mass: new_nitrous_mass,
-            fuel_grain_mass: new_fuel_grain_mass,
-            thrust: Vector3::new(0.0, 0.0, thrust),
-        }
     }
 }
 
@@ -484,17 +526,12 @@ pub struct TVC {
     pub actuator_lever_arm: f64,
     pub max_fuel_inertia: f64,
     pub min_fuel_inertia: f64,
-    starting_fuel_grain_mass: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct TVCEffect {
     pub thrust: Vector3<f64>,
     pub torque: Vector3<f64>,
-    pub nitrogen_mass: f64,
-    pub pressurizing_nitrogen_mass: f64,
-    pub nitrous_mass: f64,
-    pub fuel_grain_mass: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -505,7 +542,7 @@ pub struct ActuatorPositions {
 
 impl TVC {
     // Our actuators appear to have a stall force of 400 lbf (need to convert to metric) and an unloaded speed of 4.777173913 in/s (also convert)
-    pub fn new(mtv: MTV, x_actuator: TVCActuator, y_actuator: TVCActuator, actuator_lever_arm: f64, max_fuel_inertia: f64, min_fuel_inertia: f64, starting_fuel_grain_mass: f64) -> Self {
+    pub fn new(mtv: MTV, x_actuator: TVCActuator, y_actuator: TVCActuator, actuator_lever_arm: f64, max_fuel_inertia: f64, min_fuel_inertia: f64) -> Self {
         Self {
             mtv,
             x_actuator,
@@ -516,12 +553,11 @@ impl TVC {
             actuator_lever_arm,
             max_fuel_inertia,
             min_fuel_inertia,
-            starting_fuel_grain_mass,
         }
     }
 
-    pub fn default(starting_fuel_grain_mass: f64) -> Self {
-        let mtv = MTV::default(starting_fuel_grain_mass);
+    pub fn default() -> Self {
+        let mtv = MTV::default();
         let x_actuator = TVCActuator::default();
         let y_actuator = TVCActuator::default();
         let tvc_actuator_lever_arm = 0.1;
@@ -529,27 +565,26 @@ impl TVC {
         let tvc_max_fuel_inertia = 3.0;
         let tvc_min_fuel_inertia = 8.0;
 
-        Self::new(mtv, x_actuator, y_actuator, tvc_actuator_lever_arm, tvc_max_fuel_inertia, tvc_min_fuel_inertia, starting_fuel_grain_mass)
+        Self::new(mtv, x_actuator, y_actuator, tvc_actuator_lever_arm, tvc_max_fuel_inertia, tvc_min_fuel_inertia)
     }
 
     // engine is 11 kg with fuel, awaiting empty mass data
     // Returns the reaction torque applied to the rocket body
     // only the first two elements of command are used, the third is thrust
-    pub fn update(&mut self, command: Vector3<f64>, tvc_lever_arm: Vector3<f64>, nitrogen_mass: f64, pressurizing_nitrogen_mass: f64, nitrous_mass: f64, fuel_grain_mass: f64, dt: f64, system_time: f64) -> TVCEffect {
-        let mtv_effect = self.mtv.update(command[2], nitrogen_mass, pressurizing_nitrogen_mass,nitrous_mass, fuel_grain_mass, dt, system_time);
+    pub fn update(&mut self, command: Vector3<f64>, tvc_lever_arm: Vector3<f64>, percent_fuel_grain_mass: f64, thermo_fluid_solver: &mut ThermoFluidSolver, thrust_realized: f64, dt: f64, system_time: f64) -> TVCEffect {
+        let mtv_effect = self.mtv.update(command[2], thermo_fluid_solver, dt, system_time);
 
-        let engine_inertia = self.min_fuel_inertia + (self.max_fuel_inertia - self.min_fuel_inertia) * (fuel_grain_mass / self.starting_fuel_grain_mass);
+        let engine_inertia = self.min_fuel_inertia + (self.max_fuel_inertia - self.min_fuel_inertia) * percent_fuel_grain_mass;
         let x_load = (engine_inertia * self.x_actuator.get_accel()) / self.actuator_lever_arm.powi(2);
         let y_load = (engine_inertia * self.y_actuator.get_accel()) / self.actuator_lever_arm.powi(2);
 
         // TODO: translate gimbal angle commands to actuator target positions and update ang vels and ang accel
-        let x_target = 0.0;
-        let y_target = 0.0;
+        let target_pos = self.get_target_position(command);
         let x_angle = command[0];
         let y_angle = command[1];
 
-        self.x_actuator.update(x_target, x_load, dt, system_time);
-        self.y_actuator.update(y_target, y_load, dt, system_time);
+        self.x_actuator.update(target_pos.x_position, x_load, dt, system_time);
+        self.y_actuator.update(target_pos.y_position, y_load, dt, system_time);
 
         let reaction_torque = self.ang_accel * engine_inertia * -1.0;
         
@@ -566,7 +601,7 @@ impl TVC {
         // Combine them (Order matters! Match your physical gimbal design)
         let gimbal_rotation = y_rot * x_rot;
 
-        let thrust_vector = gimbal_rotation.transform_vector(&mtv_effect.thrust);
+        let thrust_vector = gimbal_rotation.transform_vector(&Vector3::new(0.0, 0.0, thrust_realized));
         let thrust_torque = tvc_lever_arm.cross(&thrust_vector);
 
         self.tvc_torque = reaction_torque + thrust_torque;
@@ -574,10 +609,13 @@ impl TVC {
         return TVCEffect {
             thrust: thrust_vector,
             torque: self.tvc_torque.clone(),
-            nitrogen_mass: mtv_effect.nitrogen_mass,
-            pressurizing_nitrogen_mass: mtv_effect.pressurizing_nitrogen_mass,
-            nitrous_mass: mtv_effect.nitrous_mass,
-            fuel_grain_mass: mtv_effect.fuel_grain_mass,
+        };
+    }
+
+    pub fn get_target_position(&self, command: Vector3<f64>) -> ActuatorPositions {
+        return ActuatorPositions {
+            x_position: 0.0,
+            y_position: 0.0,
         };
     }
 
@@ -586,11 +624,6 @@ impl TVC {
             x_position: self.x_actuator.get_noisy_position(),
             y_position: self.y_actuator.get_noisy_position(),
         };
-    }
-
-    pub fn get_chamber_pressure(&self) -> f64 {
-        // TODO: implement chamber pressure calculation
-        0.0
     }
 }
 
@@ -626,6 +659,8 @@ impl RCS {
     }
 
     pub fn default() -> Self {
+        // TODO: Update these placeholder values with actual RCS hardware data
+        //       once the team has better loadcell calibration numbers.
         let rcs_thrust = 10.0;
         let rcs_lever_arm = 0.15;
         let rcs_nitrogen_consumption_rate = 0.1;
@@ -634,33 +669,49 @@ impl RCS {
         Self::new(rcs_thrust, rcs_lever_arm, rcs_nitrogen_consumption_rate, rcs_update_rate)
     }
 
-    // The command is either positive, 0, or negative. positive is roll right, negative is roll left
-    // returns the torque on the rocket body
-    pub fn update(&mut self, command: f64, nitrogen_mass: f64, dt: f64, system_time: f64) -> RCSEffect {
+    // Each RCS valve controls a pair of thrusters for one roll direction.
+    //   rcs1_mv open → clockwise roll  (negative Z torque)
+    //   rcs2_mv open → counter-clockwise roll (positive Z torque)
+    //
+    // Both valves can be open simultaneously (each is independently controlled).
+    // When both are open the torques cancel but N2 is consumed by both pairs.
+    pub fn update(&mut self, rcs1_open: bool, rcs2_open: bool, nitrogen_mass: f64, dt: f64, system_time: f64) -> RCSEffect {
         let mut remaining_nitrogen_mass = nitrogen_mass;
-        let mut actual_command = command;
 
         let elapsed_time = system_time - self.system_time;
-        if elapsed_time < 1.0 / self.update_rate {
-            actual_command = self.last_command;
+        // Determine the effective valve states — hold previous state between update ticks
+        // Encoding: 2.0 = both open, 1.0 = rcs1 only, -1.0 = rcs2 only, 0.0 = neither
+        let (active_rcs1, active_rcs2) = if elapsed_time < 1.0 / self.update_rate {
+            // Between update ticks: hold previous command
+            let prev_rcs1 = self.last_command == 1.0 || self.last_command == 2.0;
+            let prev_rcs2 = self.last_command == -1.0 || self.last_command == 2.0;
+            (prev_rcs1, prev_rcs2)
         } else {
             self.system_time = system_time;
-        }
+            // Encode the current valve state into last_command for hold logic
+            if rcs1_open && rcs2_open {
+                self.last_command = 2.0;
+            } else if rcs1_open {
+                self.last_command = 1.0;
+            } else if rcs2_open {
+                self.last_command = -1.0;
+            } else {
+                self.last_command = 0.0;
+            }
+            (rcs1_open, rcs2_open)
+        };
         
-        let torque_magnitude = 2.0 * self.thrust * self.lever_arm;
-        let mut torque;
-        if actual_command == 0.0 {
-            // No action needed
-            torque = Vector3::zeros();
-        } else if actual_command > 0.0 {
-            // Positive Command -> Negative Z Torque
-            // This will roll clockwise from a top view
-            torque = Vector3::new(0.0, 0.0, -torque_magnitude);
+        let torque_per_pair = 2.0 * self.thrust * self.lever_arm;
+        let mut torque = Vector3::zeros();
+
+        if active_rcs1 {
+            // rcs1_mv open → Negative Z Torque (clockwise from top view)
+            torque.z -= torque_per_pair;
             remaining_nitrogen_mass -= self.nitrogen_consumption_rate * dt;
-        } else {
-            // Negative Command -> Positive Z Torque
-            // This will roll counterclockwise from a top view
-            torque = Vector3::new(0.0, 0.0, torque_magnitude);
+        }
+        if active_rcs2 {
+            // rcs2_mv open → Positive Z Torque (counter-clockwise from top view)
+            torque.z += torque_per_pair;
             remaining_nitrogen_mass -= self.nitrogen_consumption_rate * dt;
         }
 
@@ -671,8 +722,100 @@ impl RCS {
     }
 }
 
+/// A simulated pressure transducer (PT) that measures static pressure at a
+/// specific point in the propellant feed system.
+///
+/// Unlike inertial sensors (IMU) or radio-based sensors (GPS, UWB), pressure
+/// transducers are direct-measurement devices and are extremely stable.
+/// Aerospace piezoresistive PTs typically achieve ±0.1–0.5% of Full Scale
+/// Output (FSO) total accuracy, with the dominant error source being a fixed
+/// calibration offset (bias) rather than random noise.  For a 100 bar FS
+/// sensor, actual measurement noise is on the order of ±0.005 bar — effectively
+/// negligible step-to-step.
+///
+/// Each PT outputs a scalar pressure reading [bar] with a small Gaussian noise
+/// component and an optional fixed bias.  A configurable update rate models
+/// the real sensor's sample-and-hold behaviour.
+///
+/// PTs on this vehicle:
+///   - m2_pt  : Downstream of the MTV, before the check valve.
+///              Reads the line pressure between the throttle valve and engine.
+///   - o_pt   : Immediately downstream of the N2O run tank, before o_vnt.
+///              Used by the vent controller to decide whether/how long to
+///              open the oxidizer vent valve.
+///   - oa_pt  : Upstream of the N2O run tank, downstream of r_mv.
+///              Reads the regulated nitrogen supply pressure entering the
+///              run tank.
+#[derive(Debug, Clone)]
+pub struct PressureTransducer {
+    /// Human-readable label for logging (e.g. "m2-pt")
+    pub label: String,
+    /// Standard deviation of the Gaussian measurement noise [bar].
+    /// Typical value for a 100 bar FS piezoresistive PT is ~0.005 bar.
+    pub noise_sigma: f64,
+    /// Fixed measurement bias (calibration offset) [bar]
+    pub bias: f64,
+    /// Most recent output (held between update ticks)
+    pub last_reading: PTReading,
+    /// Sensor sample rate [Hz] — piezoresistive PTs commonly run at 1 kHz+
+    pub update_rate: f64,
+    /// Internal clock tracking when the last update was issued
+    system_time: f64,
+}
+
+/// A single pressure transducer reading.
+#[derive(Debug, Clone)]
+pub struct PTReading {
+    /// Measured pressure [bar], including noise and bias
+    pub pressure_bar: f64,
+}
+
+impl PressureTransducer {
+    pub fn new(label: &str, noise_sigma: f64, bias: f64, update_rate: f64) -> Self {
+        Self {
+            label: label.to_string(),
+            noise_sigma,
+            bias,
+            last_reading: PTReading { pressure_bar: 0.0 },
+            update_rate,
+            system_time: 0.0,
+        }
+    }
+
+    /// Convenience constructor with realistic defaults for a 0–100 bar
+    /// aerospace piezoresistive PT:
+    ///   - 0.005 bar noise sigma  (~0.005% FS — essentially negligible)
+    ///   - Zero bias
+    ///   - 1000 Hz sample rate
+    pub fn default_with_label(label: &str) -> Self {
+        Self::new(label, 0.005, 0.0, 1000.0)
+    }
+
+    /// Feed the sensor the true local pressure.  Returns a (possibly stale)
+    /// reading.  Between update ticks the previous value is returned unchanged,
+    /// matching sample-and-hold hardware behaviour.
+    pub fn update(&mut self, true_pressure_bar: f64, system_time: f64) -> PTReading {
+        let elapsed = system_time - self.system_time;
+        if elapsed < 1.0 / self.update_rate {
+            return self.last_reading.clone();
+        }
+
+        self.system_time = system_time;
+
+        let mut rng = rand::rng();
+        let noise = noise_1_d(self.noise_sigma, &mut rng);
+
+        self.last_reading = PTReading {
+            pressure_bar: true_pressure_bar + self.bias + noise,
+        };
+
+        self.last_reading.clone()
+    }
+}
+
+
 // Helper to generate 3D noise
-fn noise_3_d(sigma: &Vector3<f64>, rng: &mut ThreadRng) -> Vector3<f64> {
+pub fn noise_3_d(sigma: &Vector3<f64>, rng: &mut ThreadRng) -> Vector3<f64> {
     let n_x = Normal::new(0.0, sigma.x).unwrap().sample(rng);
     let n_y = Normal::new(0.0, sigma.y).unwrap().sample(rng);
     let n_z = Normal::new(0.0, sigma.z).unwrap().sample(rng);
@@ -680,6 +823,6 @@ fn noise_3_d(sigma: &Vector3<f64>, rng: &mut ThreadRng) -> Vector3<f64> {
 }
 
 // Helper to generate 3D noise
-fn noise_1_d(sigma: f64, rng: &mut ThreadRng) -> f64 {
+pub fn noise_1_d(sigma: f64, rng: &mut ThreadRng) -> f64 {
     Normal::new(0.0, sigma).unwrap().sample(rng)
 }

@@ -1,0 +1,4 @@
+run_name,pass,attempts,successes,iterations,clarabel_solve_time_s,wall_time_s,last_status,time_of_flight_s
+zoh_direct_limited_descent_short_1,coarse,3,1,80,3.118954,3.160508,Solved,11.100000
+zoh_direct_limited_descent_short_1,fine,1,1,34,1.314567,1.331313,Solved,11.100000
+zoh_direct_limited_descent_short_1,total,4,2,114,4.433521,5.537861,Solved,11.100000

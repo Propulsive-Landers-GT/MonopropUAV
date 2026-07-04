@@ -1,16 +1,20 @@
+use crate::lossless::*;
 use crate::rocket_dynamics::*;
 use crate::device_sim::*;
 use crate::algorithms::*;
+use crate::algorithms::lossless::*;
 use crate::sloshing_sim::*;
 use crate::fluid_dynamics::*;
 use nalgebra::{Matrix3, Vector3, Vector4, UnitQuaternion};
 use ndarray::{Array1, Array2};
+use rerun::*;
 
 #[derive(Debug)]
 pub struct Simulation {
     pub rocket: Rocket,
     pub mpc: MPC,
     pub lossless: Lossless,
+    pub rcs_controller: RcsController,
     pub debug: bool,
     pub dt: f64,
     pub current_time: f64,
@@ -21,7 +25,7 @@ pub struct Simulation {
     pub start_state: String,
     pub end_state: String,
     pub end_stage: i32,
-    pub rec: Option<rerun::RecordingStream>,
+    pub rec: Option<RecordingStream>,
 }
 
 impl Default for Simulation {
@@ -30,6 +34,7 @@ impl Default for Simulation {
             rocket: Rocket::default(),
             mpc: MPC::default(),
             lossless: Lossless::default(),
+            rcs_controller: RcsController::default(),
             dt: 0.01,
             current_time: 0.0,
             debug: false,
@@ -46,11 +51,12 @@ impl Default for Simulation {
 }
 
 impl Simulation {
-    pub fn new(rocket: Rocket, mpc: MPC, lossless: Lossless, dt: f64, current_time: f64, debug: bool, has_exceeded_angle: bool, min_time: f64, traj_stage: i32, traj_timer: f64, start_state: String, end_state: String) -> Self {
+    pub fn new(rocket: Rocket, mpc: MPC, lossless: Lossless, rcs_controller: RcsController, dt: f64, current_time: f64, debug: bool, has_exceeded_angle: bool, min_time: f64, traj_stage: i32, traj_timer: f64, start_state: String, end_state: String) -> Self {
         let mut simulation = Self {
             rocket,
             mpc,
             lossless,
+            rcs_controller,
             dt,
             current_time,
             debug,
@@ -75,7 +81,7 @@ impl Simulation {
             // FIX: Use .connect_grpc() as the compiler suggested.
             // This connects to the 'rerun --web-viewer' running in your other terminal.
             self.rec = Some(
-                rerun::RecordingStreamBuilder::new("rocket_sim")
+                RecordingStreamBuilder::new("rocket_sim")
                     .connect_grpc()
                     .expect("🚨 FATAL: Failed to connect to the Rerun viewer!")
             );
@@ -87,12 +93,12 @@ impl Simulation {
             // 1. Ground
             let _ = self.rec.as_ref().unwrap().log(
                 "world/ground",
-                &rerun::Boxes3D::from_centers_and_half_sizes(
+                &Boxes3D::from_centers_and_half_sizes(
                     [(0.0, 0.0, -0.05)], // Center: Shift down slightly so y=0 is the top surface
                     [(100.0, 100.0, 0.05)], // Half-sizes: 200x200 wide, 0.1 thick
                 )
-                .with_colors([rerun::Color::from_rgb(40, 40, 40)]) // Dark Grey
-                .with_fill_mode(rerun::FillMode::Solid), // Make it solid, not wireframe
+                .with_colors([Color::from_rgb(40, 40, 40)]) // Dark Grey
+                .with_fill_mode(FillMode::Solid), // Make it solid, not wireframe
             );
         }
 
@@ -110,6 +116,18 @@ impl Simulation {
             val if *val == "descent".to_string() => self.end_stage = 2,
             _ => self.end_stage = -1,
         }
+
+        self.lossless.system_time = -30.0;
+        self.lossless.lossless_refresh_updater.reset(0.0, 0.0, self.lossless.system_time);
+        self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 50.0], self.rocket.get_mass() - self.rocket.get_dry_mass(), -20.0);
+        self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 50.0], self.rocket.get_mass() - self.rocket.get_dry_mass(), -10.0);
+
+        self.mpc.system_time = -20.0;
+        self.mpc.refresh_updater.reset(0.0, self.mpc.system_time);
+        self.mpc.update(&self.rocket.get_state(), &vec![Array1::zeros(13); self.mpc.n_steps + 1], &vec![Array1::zeros(3); self.mpc.n_steps], self.rocket.get_mass(), &self.rocket.get_moi_mpc(), -10.0);
+        
+        let (_, _, yaw) = self.rocket.attitude.euler_angles();
+        self.rcs_controller.update(yaw, self.rocket.ang_vel.z, -10.0);
     }
 
     pub fn step(&mut self) -> bool {
@@ -154,8 +172,21 @@ impl Simulation {
         // 3. Interpolate! 
         // Because u_0 and u_1 are ndarray::Array1<f64>, Rust lets you do the vector math directly.
         let current_control = u_0 + progress * (u_1 - u_0);
+        
+        let (_, _, yaw) = self.rocket.attitude.euler_angles();
+        let rcs_command = self.rcs_controller.update(yaw, self.rocket.ang_vel.z, self.current_time);
+        let translated_rcs_command;
+        if rcs_command.firing_positive && rcs_command.firing_negative {
+            translated_rcs_command = 0.0;
+        } else if rcs_command.firing_positive {
+            translated_rcs_command = -1.0; // Example: positive firing adds to the control input
+        } else if rcs_command.firing_negative {
+            translated_rcs_command = 1.0; // Example: negative firing subtracts from the control input
+        } else {
+            translated_rcs_command = 0.0;
+        }
 
-        let control_input = Vector4::new(current_control[0], current_control[1], current_control[2], 0.0); // Convert first control input to Vector4 (assuming the 4th component is not used for now)
+        let control_input = Vector4::new(current_control[0], current_control[1], current_control[2], translated_rcs_command); // Convert first control input to Vector4 (assuming the 4th component is not used for now)
 
         if !self.rocket.step(control_input, outside_forces, outside_torques, self.dt) && self.current_time > self.min_time {
             return false;
@@ -173,14 +204,16 @@ impl Simulation {
             let normalized_thrust_vector = self.rocket.thrust_vector / 1000.0; // Scale for visualization
             let rocket_color;
             if self.has_exceeded_angle {
-                rocket_color = rerun::Color::from_rgb(255, 0, 0);
+                rocket_color = Color::from_rgb(255, 0, 0);
             } else {
-                rocket_color = rerun::Color::from_rgb(0, 255, 0);
+                rocket_color = Color::from_rgb(0, 255, 0);
             }
             let rotated_offset = self.rocket.attitude.transform_vector(&self.rocket.com_to_ground);
+            let rocket_forward = self.rocket.attitude.transform_vector(&Vector3::new(1.0, 0.0, 0.0));
+
             let _ = self.rec.as_ref().unwrap().log(
                 "world/rocket",
-                &rerun::Arrows3D::from_vectors([((-2.0 * rotated_offset.x) as f32, (-2.0 * rotated_offset.y) as f32, (-2.0 * rotated_offset.z) as f32)])
+                &Arrows3D::from_vectors([((-2.0 * rotated_offset.x) as f32, (-2.0 * rotated_offset.y) as f32, (-2.0 * rotated_offset.z) as f32)])
                     .with_origins([[(self.rocket.position.x+rotated_offset.x) as f32, (self.rocket.position.y+rotated_offset.y) as f32, (self.rocket.position.z+rotated_offset.z) as f32]])
                     .with_colors([rocket_color]) 
             );
@@ -188,26 +221,43 @@ impl Simulation {
             // Log Thrust Vector
             let _ = self.rec.as_ref().unwrap().log(
                 "world/thrust_vector",
-                &rerun::Arrows3D::from_vectors([((normalized_thrust_vector.x) as f32, (normalized_thrust_vector.y) as f32, (normalized_thrust_vector.z) as f32)])
+                &Arrows3D::from_vectors([((normalized_thrust_vector.x) as f32, (normalized_thrust_vector.y) as f32, (normalized_thrust_vector.z) as f32)])
                     .with_origins([[(self.rocket.position.x+rotated_offset.x) as f32, (self.rocket.position.y+rotated_offset.y) as f32, (self.rocket.position.z+rotated_offset.z) as f32]])
-                    .with_colors([rerun::Color::from_rgb(0, 0, 255)]) 
+                    .with_colors([Color::from_rgb(0, 0, 255)]) 
+            );
+
+            // Log Forward Vector
+            let _ = self.rec.as_ref().unwrap().log(
+                "world/forward_vector",
+                &Arrows3D::from_vectors([((rocket_forward.x) as f32, (rocket_forward.y) as f32, (rocket_forward.z) as f32)])
+                    .with_origins([[(self.rocket.position.x) as f32, (self.rocket.position.y) as f32, (self.rocket.position.z) as f32]])
+                    .with_colors([Color::from_rgb(255, 165, 0)]) 
             );
 
             // Log the rocket's position for visualization
             let _ = self.rec.as_ref().unwrap().log(
                 "world/rocket",
-                &rerun::Points3D::new([(self.rocket.position.x as f32, self.rocket.position.y as f32, self.rocket.position.z as f32)])
+                &Points3D::new([(self.rocket.position.x as f32, self.rocket.position.y as f32, self.rocket.position.z as f32)])
                     .with_colors([rocket_color]) // Red color for the rocket
                     .with_radii([0.1]) // Size of the point representing the rocket
             );
 
-            // Log the rocket's position for visualization
+            // Log the current simulation time
             let _ = self.rec.as_ref().unwrap().log(
                 "world/timer",
-                &rerun::Points3D::new([(self.current_time as f32, 0.0, 0.0)])
-                    .with_colors([rerun::Color::from_rgb(0, 255, 0)]) // Green color for the timer
+                &Points3D::new([(self.current_time as f32, 0.0, 0.0)])
+                    .with_colors([Color::from_rgb(0, 255, 0)]) // Green color for the timer
                     .with_radii([0.1]) // Size of the point representing the timer
             );
+
+            // 1. Safely check if we actually have a recording stream configured
+            if let Some(rec) = &self.rec {
+                // 2. Call the function without the `?` operator. 
+                // 3. Match on the Result to handle potential graphics errors gracefully!
+                if let Err(e) = Self::plot_trajectory(rec, &self.lossless.current_traj, self.current_time - self.lossless.last_solve_time) {
+                    eprintln!("Warning: Failed to plot trajectory to Rerun: {}", e);
+                }
+            }
         }
 
         self.current_time += self.dt;
@@ -235,8 +285,74 @@ impl Simulation {
         if self.traj_stage == 0 {
             // 1. Stage Cost (Q) - Massive penalty for Z errors
             self.mpc.q = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 200.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
+                150.0, 150.0, 600.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
                 40000.0, 40000.0, 0.0, 0.0,
+                // 100.0, 100.0, 6000.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
+                100.0, 100.0, 2000.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
+                500.0, 500.0, 500.0   
+            ]));
+
+            // 2. Control Cost (R) - Remove the fear of using the throttle!
+            // Gimbal X/Y stay at 50 (because radians are tiny numbers), Thrust drops to 0.005!
+            self.mpc.r = Array2::<f64>::from_diag(&Array1::from(vec![50.0, 50.0, 0.005]));
+
+            // 3. Terminal Cost (QN) - Land softly!
+            self.mpc.qn = Array2::<f64>::from_diag(&Array1::from(vec![
+                150.0, 150.0, 600.0, 
+                50000.0, 50000.0, 0.0, 0.0,
+                100.0, 100.0, 2000.0, 
+                1000.0, 1000.0, 1000.0 
+            ]));
+            self.lossless.use_terminal_lateral_hard_tube = true;
+            self.lossless.terminal_lateral_hard_tube_time_s = 0.5;
+            self.lossless.terminal_lateral_hard_tube_radius_m = 0.05;
+
+            self.lossless.max_velocity = 5.0;
+            let mut trajectory;
+            if self.rocket.position.z < 40.0 {
+                trajectory = self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 50.0], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
+            } else {
+                trajectory = self.lossless.current_traj.clone();
+            }
+            (xref_traj, uref_traj) = self.get_mpc_reference(&trajectory, self.current_time - self.lossless.last_solve_time, self.rocket.attitude, self.mpc.min_thrust, self.mpc.dt, self.lossless.fine_delta_t, self.mpc.n_steps + 1);
+            if self.rocket.position.z >= 48.0 {
+                self.traj_stage = 1;
+                self.traj_timer = self.current_time;
+            }
+            // uref_traj = vec![Array1::from(vec![0.0, 0.0, mass * 9.81]); mpc.n_steps]; // Warm start with zero control inputs
+        } else if self.traj_stage == 1 {
+            self.mpc.q = Array2::<f64>::from_diag(&Array1::from(vec![
+                200.0, 200.0, 800.0,   // position x, y, z
+                60000.0, 60000.0, 0.0, 0.0, // quaternion qx, qy, qz, qw
+                100.0, 100.0, 250.0,        // linear velocities x_dot, y_dot, z_dot
+                500.0, 500.0, 500.0          // angular velocities wx, wy, wz
+            ]));
+            self.mpc.r = Array2::<f64>::from_diag(&Array1::from(vec![50.0, 50.0, 1.0]));
+            self.mpc.qn = Array2::<f64>::from_diag(&Array1::from(vec![
+                200.0, 200.0, 1000.0,   // position x, y, z
+                100000.0, 100000.0, 0.0, 0.0, // quaternion qx, qy, qz, qw
+                100.0, 100.0, 300.0,        // linear velocities x_dot, y_dot, z_dot
+                1000.0, 1000.0, 1000.0          // angular velocities wx, wy, wz
+            ]));
+            xref_traj = vec![Array1::from(vec![0.0, 0.0, 50.0, // x, y, z
+                                                0.0, 0.0, 0.0, 1.0, // qx, qy, qz, qw (upright)
+                                                0.0, 0.0, 0.0, // x_dot, y_dot, z_dot
+                                                0.0, 0.0, 0.0]); // wx, wy, wz
+                                                self.mpc.n_steps + 1];
+            uref_traj = vec![Array1::from(vec![0.0, 0.0, self.rocket.get_mass() * 9.81]); self.mpc.n_steps]; // Warm start with zero control inputs
+            self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [0.0, 0.0, 0.0], [0.0, 0.0, 1.5], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
+            self.lossless.last_solve_time = self.current_time;
+            if self.current_time - self.traj_timer >= 10.0 {
+                self.traj_stage = 2;
+                self.traj_timer = self.current_time;
+            }
+        } else if self.traj_stage == 2 {
+            // TODO: fix the vertical (and horizontal) drift during hovering
+
+            // 1. Stage Cost (Q) - Massive penalty for Z errors
+            self.mpc.q = Array2::<f64>::from_diag(&Array1::from(vec![
+                300.0, 300.0, 800.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
+                100000.0, 100000.0, 0.0, 0.0,
                 100.0, 100.0, 6000.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
                 500.0, 500.0, 500.0   
             ]));
@@ -247,76 +363,25 @@ impl Simulation {
 
             // 3. Terminal Cost (QN) - Land softly!
             self.mpc.qn = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 200.0, 
-                50000.0, 50000.0, 0.0, 0.0,
-                100.0, 100.0, 80000.0, 
+                150.0, 150.0, 50000.0, 
+                120000.0, 120000.0, 0.0, 0.0,
+                100.0, 100.0, 200.0, 
                 1000.0, 1000.0, 1000.0 
             ]));
-            self.lossless.max_velocity = 5.0;
-            let trajectory = self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 50.0], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
-            (xref_traj, uref_traj) = self.get_mpc_reference(&trajectory, self.current_time - self.lossless.last_solve_time, self.rocket.attitude, self.mpc.min_thrust, self.mpc.dt, self.lossless.fine_delta_t, self.mpc.n_steps + 1);
-            if self.rocket.position.z >= 45.0 {
-                self.traj_stage = 1;
-                self.traj_timer = self.current_time;
-            }
-            // uref_traj = vec![Array1::from(vec![0.0, 0.0, mass * 9.81]); mpc.n_steps]; // Warm start with zero control inputs
-        } else if self.traj_stage == 1 {
-            self.mpc.q = Array2::<f64>::from_diag(&Array1::from(vec![
-                200.0, 200.0, 600.0,   // position x, y, z
-                60000.0, 60000.0, 0.0, 0.0, // quaternion qx, qy, qz, qw
-                100.0, 100.0, 250.0,        // linear velocities x_dot, y_dot, z_dot
-                500.0, 500.0, 500.0          // angular velocities wx, wy, wz
-            ]));
-            self.mpc.r = Array2::<f64>::from_diag(&Array1::from(vec![50.0, 50.0, 1.0]));
-            self.mpc.qn = Array2::<f64>::from_diag(&Array1::from(vec![
-                200.0, 200.0, 800.0,   // position x, y, z
-                100000.0, 100000.0, 0.0, 0.0, // quaternion qx, qy, qz, qw
-                100.0, 100.0, 200.0,        // linear velocities x_dot, y_dot, z_dot
-                1000.0, 1000.0, 1000.0          // angular velocities wx, wy, wz
-            ]));
-            xref_traj = vec![Array1::from(vec![0.0, 0.0, 50.0, // x, y, z
-                                                0.0, 0.0, 0.0, 1.0, // qx, qy, qz, qw (upright)
-                                                0.0, 0.0, 0.0, // x_dot, y_dot, z_dot
-                                                0.0, 0.0, 0.0]); // wx, wy, wz
-                                                self.mpc.n_steps + 1];
-            uref_traj = vec![Array1::from(vec![0.0, 0.0, self.rocket.get_mass() * 9.81]); self.mpc.n_steps]; // Warm start with zero control inputs
-            if self.current_time - self.traj_timer >= 10.0 {
-                self.traj_stage = 2;
-                self.traj_timer = self.current_time;
-            }
-        } else if self.traj_stage == 2 {
-            // TODO: fix the vertical (and horizontal) drift during hovering
-
-            // 1. Stage Cost (Q) - Massive penalty for Z errors
-            self.mpc.q = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 500.0,  // Stiffened Z-Position spring (from 40.0 to 1500.0)
-                40000.0, 40000.0, 0.0, 0.0,
-                100.0, 100.0, 250.0,  // Stiffened Z-Velocity damper (from 300.0 to 2500.0)
-                500.0, 500.0, 500.0   
-            ]));
-
-            // 2. Control Cost (R) - Remove the fear of using the throttle!
-            // Gimbal X/Y stay at 50 (because radians are tiny numbers), Thrust drops to 0.005!
-            self.mpc.r = Array2::<f64>::from_diag(&Array1::from(vec![50.0, 50.0, 0.005]));
-
-            // 3. Terminal Cost (QN) - Land softly!
-            self.mpc.qn = Array2::<f64>::from_diag(&Array1::from(vec![
-                150.0, 150.0, 500.0, 
-                50000.0, 50000.0, 0.0, 0.0,
-                100.0, 100.0, 800.0, 
-                1000.0, 1000.0, 1000.0 
-            ]));
-            self.lossless.lower_thrust_bound = 400.0;
-            self.lossless.flip_glide_slope = false;
-            self.lossless.use_glide_slope = true;
-            // self.lossless.glide_slope = 20.0_f64.to_radians();
-            self.lossless.max_velocity = 5.0;
+            self.lossless.lower_thrust_bound = 500.0;
+            // self.lossless.flip_glide_slope = false;
+            // self.lossless.use_glide_slope = true;
+            self.lossless.use_bottom_glide_slope = true;
+            // self.lossless.use_top_glide_slope = true;
+            self.lossless.use_top_glide_slope = false;
+            self.lossless.glide_slope = 0.005_f64.to_radians();
+            // self.lossless.max_velocity = 5.0;
             // if self.rocket.velocity.norm() >= 5.0 {
             //     self.lossless.max_velocity = self.rocket.velocity.norm() * 1.25;
             // }
-            let trajectory = self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 0.0], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
+            let trajectory = self.lossless.update([self.rocket.position.x, self.rocket.position.y, self.rocket.position.z], [self.rocket.velocity.x, self.rocket.velocity.y, self.rocket.velocity.z], [0.0, 0.0, 1.5-0.5], self.rocket.get_mass() - self.rocket.get_dry_mass(), self.current_time);
             (xref_traj, uref_traj) = self.get_mpc_reference(&trajectory, self.current_time - self.lossless.last_solve_time, self.rocket.attitude, self.mpc.min_thrust, self.mpc.dt, self.lossless.fine_delta_t, self.mpc.n_steps + 1);
-            if self.current_time - self.traj_timer > 20.0 {
+            if self.current_time - self.traj_timer > 30.0 {
                 self.traj_stage = -1;
                 self.end_stage = -1;
             }
@@ -375,8 +440,8 @@ impl Simulation {
             if t_target >= traj.time_of_flight_s || num_points <= 1 {
                 if num_points <= 1 {
                     // 🚨 TRAJECTORY CRASHED: Fallback to a safe, slow vertical drop
-                    interp_p = [0.0, 0.0, -2.0];
-                    interp_v = [0.0, 0.0, -2.0]; 
+                    interp_p = [0.0, 0.0, 0.0];
+                    interp_v = [0.0, 0.0, 0.0]; 
                     interp_u = [0.0, 0.0, default_thrust];
                 } else {
                     // Normal completion: Extrapolate the final state smoothly!
@@ -388,10 +453,15 @@ impl Simulation {
                     let dt_overfill = t_target - traj.time_of_flight_s;
                     
                     // Extrapolate position: p = p_final + v_final * dt
+                    // interp_p = [
+                    //     final_p[0] + final_v[0] * dt_overfill,
+                    //     final_p[1] + final_v[1] * dt_overfill,
+                    //     final_p[2] + final_v[2] * dt_overfill,
+                    // ];
                     interp_p = [
-                        final_p[0] + final_v[0] * dt_overfill,
-                        final_p[1] + final_v[1] * dt_overfill,
-                        final_p[2] + final_v[2] * dt_overfill,
+                        final_p[0],
+                        final_p[1],
+                        final_p[2],
                     ];
                     
                     // Keep asking for the final velocity to prevent the MPC from braking too early
@@ -463,5 +533,55 @@ impl Simulation {
         }
         
         (xref_traj, uref_traj)
+    }
+
+    pub fn plot_trajectory(
+        rec: &RecordingStream, 
+        traj: &TrajectoryResult, 
+        elapsed_trajectory_time: f64 // 🚀 NEW: How long ago was this trajectory solved?
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        
+        let num_nodes = traj.positions.len();
+        if num_nodes < 2 { return Ok(()); } // Need at least 2 points to draw a line
+
+        // 1. Calculate the time spacing between each node
+        // (Divide total flight time by the number of gaps between nodes)
+        let dt = traj.time_of_flight_s / (num_nodes - 1) as f64;
+
+        // 2. Calculate how many nodes we have already flown past
+        let nodes_passed = (elapsed_trajectory_time / dt).floor() as usize;
+        
+        // Safety clamp to ensure we don't skip past the end of the array
+        let start_index = nodes_passed.min(num_nodes - 1);
+
+        // 3. Cast to f32 AND filter out the past using `.skip()`
+        let graphics_positions: Vec<[f32; 3]> = traj.positions
+            .iter()
+            .skip(start_index) // 🚀 MAGIC: Ignores the first N elements!
+            .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+            .collect();
+
+        // If we only have 1 point left, we can't draw a line, so just exit cleanly
+        if graphics_positions.len() < 2 {
+            return Ok(());
+        }
+
+        // 4. Log the future path
+        rec.log(
+            "rocket/trajectory/path",
+            &LineStrips3D::new([graphics_positions.clone()])
+                .with_colors([Color::from_rgb(0, 150, 255)]) 
+                .with_radii([0.05]), 
+        )?;
+
+        // 5. Log the future nodes
+        rec.log(
+            "rocket/trajectory/nodes",
+            &Points3D::new(graphics_positions)
+                .with_colors([Color::from_rgb(255, 100, 0)]) 
+                .with_radii([0.1]), // Beautiful, small dots
+        )?;
+
+        Ok(())
     }
 }

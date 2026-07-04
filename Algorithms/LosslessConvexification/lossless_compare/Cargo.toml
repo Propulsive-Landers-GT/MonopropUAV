@@ -1,0 +1,8 @@
+[package]
+name = "lossless_compare"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clarabel = "0.7"
+rust_lossless = { path = "../rust_lossless" }

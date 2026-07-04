@@ -2,6 +2,11 @@
 name = "rust_rocket_sim"
 version = "0.1.0"
 edition = "2024"
+autobins = false
+
+[[bin]]
+name = "rust_rocket_sim"
+path = "src/main.rs"
 
 [dependencies]
 rerun = "0.28"

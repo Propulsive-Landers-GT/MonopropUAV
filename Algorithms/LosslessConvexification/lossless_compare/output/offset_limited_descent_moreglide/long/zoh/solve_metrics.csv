@@ -1,0 +1,4 @@
+run_name,pass,attempts,successes,iterations,clarabel_solve_time_s,wall_time_s,last_status,time_of_flight_s
+zoh_offset_limited_descent_moreglide_long_1,coarse,13,1,255,43.199945,43.449631,Solved,12.200000
+zoh_offset_limited_descent_moreglide_long_1,fine,6,6,182,81.437818,81.742623,Solved,12.075000
+zoh_offset_limited_descent_moreglide_long_1,total,19,7,437,124.637764,138.017848,Solved,12.075000
