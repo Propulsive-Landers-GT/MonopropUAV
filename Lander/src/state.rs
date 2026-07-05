@@ -8,6 +8,8 @@ pub struct ImuData {
     pub mag: [f64; 3],
 }
 
+// TODO: Update the SensorData struct to be more representative of the data provided by the VN-200
+    // Bonus points if you can create an IMU abstraction to allow any IMU and it's data to be utilized
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SensorData {
     pub timestamp: f64,

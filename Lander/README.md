@@ -102,6 +102,15 @@ The Lander transitions through the following discrete flight phases:
 
 ---
 
+## Real-Time Execution & Safety Contingencies
+
+*   **Real-Time Priority Scheduling**: To leverage `RT-PREEMPT` real-time kernels, the flight computer thread configures its scheduling policy on Linux to `SCHED_FIFO` with a priority of `80`. This ensures deterministic execution and eliminates context preemption jitter.
+*   **GPS/UWB Denial Emergency Landing**: If absolute position sensor data (GPS/UWB) is lost for more than 5 seconds during the Ascent or Hover phases, the state machine transitions directly to `Descent` to attempt an emergency soft landing at the origin `[0.0, 0.0, 0.0]` using EKF dead reckoning. If absolute position denial exceeds 15 seconds, a hard safety cutoff (flight termination) is triggered.
+*   **Pre-Arm Health Checks Validation**: The transition from `Standby` to `Armed` is gated by a validation checklist requiring that sensor readings are within valid operational limits and the EKF state variances have fully converged.
+*   **Decoupled Master Timing**: Time-tracking is governed by a dedicated monotonic `Clock` struct owned by the scheduler loop, keeping timing references decoupled from the telemetry logging library.
+
+---
+
 ## Interactive Command Console
 
 The flight computer binary runs a non-blocking console interface. Operators can type the following commands directly into the terminal to transition the flight phase:

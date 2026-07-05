@@ -40,7 +40,6 @@ enum LogMessage {
 pub struct McapLogger {
     tx: std::sync::mpsc::Sender<LogMessage>,
     worker_join_handle: Option<std::thread::JoinHandle<()>>,
-    start_time: std::time::Instant,
     last_logged_phase: Option<FlightPhase>,
 }
 
@@ -48,8 +47,6 @@ impl McapLogger {
     pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let path_str = path.to_string();
         let (tx, rx) = std::sync::mpsc::channel::<LogMessage>();
-        
-        let start_time = std::time::Instant::now();
         
         let worker_join_handle = std::thread::spawn(move || {
             let file = File::create(&path_str).expect("Failed to create MCAP file");
@@ -210,17 +207,8 @@ impl McapLogger {
         Ok(Self {
             tx,
             worker_join_handle: Some(worker_join_handle),
-            start_time,
             last_logged_phase: None,
         })
-    }
-    
-    pub fn get_timestamp_ns(&self) -> u64 {
-        self.start_time.elapsed().as_nanos() as u64
-    }
-
-    pub fn get_elapsed_seconds(&self) -> f64 {
-        self.start_time.elapsed().as_secs_f64()
     }
     
     pub fn log_sensor_data(&mut self, timestamp_ns: u64, data: &SensorData) -> Result<(), Box<dyn std::error::Error>> {

@@ -14,3 +14,4 @@ MPC = { path = "../Algorithms/MPC" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 mcap = "0.25.0"
+libc = "0.2"

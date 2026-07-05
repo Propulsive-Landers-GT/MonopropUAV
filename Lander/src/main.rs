@@ -24,7 +24,61 @@ fn spawn_stdin_channel() -> Receiver<String> {
     rx
 }
 
+pub struct Clock {
+    start_time: std::time::Instant,
+}
+
+impl Clock {
+    pub fn new() -> Self {
+        Self {
+            start_time: std::time::Instant::now(),
+        }
+    }
+
+    pub fn elapsed_ns(&self) -> u64 {
+        self.start_time.elapsed().as_nanos() as u64
+    }
+
+    pub fn elapsed_secs(&self) -> f64 {
+        self.start_time.elapsed().as_secs_f64()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_realtime_priority() {
+    unsafe {
+        let thread_id = libc::pthread_self();
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = 80;
+        
+        let result = libc::pthread_setschedparam(
+            thread_id,
+            libc::SCHED_FIFO,
+            &param,
+        );
+        
+        if result == 0 {
+            println!("Successfully set thread scheduling to real-time SCHED_FIFO (priority 80)");
+        } else {
+            println!(
+                "[Warning] Failed to set real-time thread scheduling (error code: {}). \
+                Run with administrative privileges (sudo/CAP_SYS_NICE) for deterministic timing.",
+                result
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_realtime_priority() {
+    println!(
+        "[Warning] Real-time thread scheduling is only supported on Linux targets. \
+        Running under default OS scheduler."
+    );
+}
+
 fn main() {
+    configure_realtime_priority();
     println!("Lander Flight State Machine Starting...");
     println!("Interactive console commands: 'arm', 'disarm', 'launch'");
     
@@ -32,6 +86,8 @@ fn main() {
     fsm.initialize();
     
     let stdin_rx = spawn_stdin_channel();
+    
+    let clock = Clock::new();
     
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -43,12 +99,9 @@ fn main() {
         
     println!("FSM running...");
     
-    let mut last_print_second = -1;
-    let mut mission_time = 0.0;
-
     loop {
-        let timestamp_ns = mcap_logger.get_timestamp_ns();
-        mission_time = mcap_logger.get_elapsed_seconds();
+        let timestamp_ns = clock.elapsed_ns();
+        let mission_time = clock.elapsed_secs();
 
         // Check for stdin commands
         if let Ok(cmd) = stdin_rx.try_recv() {
@@ -60,7 +113,9 @@ fn main() {
             }
         }
 
-        // Initialize sensor readings (mock VN-200 INS data packet at current mission_time)
+        // Initialize sensor readings
+        // TODO: Update sensor inits to either be more realistic or Nones until we start recieving to help gate bad starts
+        //       Cannot guarantee what the data will look like on start and we shouldn't assume we'll always know
         let sensor_data = SensorData {
             timestamp: mission_time,
             imu_data: Some(state::ImuData {
@@ -105,24 +160,11 @@ fn main() {
                 control_output[1],
                 control_output[2],
             );
-            
-            println!("Control (theta, phi, thrust): {:?}", control_output);
         }
         
         // Log vehicle state and flight phase
         let _ = mcap_logger.log_vehicle_state(timestamp_ns, &fsm.get_state().vehicle_state);
         let _ = mcap_logger.log_flight_phase(timestamp_ns, fsm.get_state().flight_phase, mission_time);
-                
-        // Print status every second
-        let current_second = mission_time.floor() as i32;
-        if current_second > last_print_second {
-            println!("Time: {:.2}s, Alt: {:.2}m, Phase: {:?}", 
-                mission_time,
-                fsm.get_state().vehicle_state.position.z,
-                fsm.get_state().flight_phase
-            );
-            last_print_second = current_second;
-        }
         
         if fsm.get_state().flight_phase == state::FlightPhase::Landed {
             println!("Landed successfully at {:.2}m altitude!", fsm.get_state().vehicle_state.position.z);
@@ -130,7 +172,8 @@ fn main() {
             break;
         }
         
-        // Sleep to maintain EKF / loop rate at 500 Hz
+        // Sleep to maintain EKF / loop rate at 500 Hz 
+        // TODO: Does thread sleep use an actual atomic clock tho? I think we have a general timing issue where we aren't use the actual Jetson computer time, but time relative to however the program is perciveing it at the moment
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     

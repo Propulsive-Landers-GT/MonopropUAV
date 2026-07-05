@@ -24,10 +24,10 @@ impl FlightStateMachine {
         
         // Configure default parameters
         lossless.dry_mass = 50.0;
-        lossless.upper_thrust_bound = 1200.0;
+        lossless.upper_thrust_bound = 1000.0;
         lossless.max_velocity = 15.0;
         mpc.mass = 80.0;
-        mpc.max_thrust = 1200.0;
+        mpc.max_thrust = 1000.0;
         
         let previous_control = vec![Array1::from(vec![0.0, 0.0, 80.0 * 9.81]); 10];
         
@@ -36,7 +36,7 @@ impl FlightStateMachine {
             guidance: Box::new(lossless),
             controller: Box::new(mpc),
             state: ControlLoopState::default(),
-            goal: [0.0, 0.0, 50.0],
+            goal: [0.0, 0.0, 50.0], // The ascent target. The descent targets the origin [0.0, 0.0, 0.0] as the landing pad.
             sensor_fusion_rate: 500.0,
             navigation_rate: 1.0,
             mpc_rate: 50.0,
@@ -79,6 +79,7 @@ impl FlightStateMachine {
     }
     
     pub fn arm(&mut self, now: f64) {
+        // TODO: Implement a comprehensive suite of pre-launch health checks (e.g. check sensor telemetry values are in range, verify EKF variance convergence, check tank/battery levels) that must all pass before we can arm.
         if self.state.flight_phase == FlightPhase::Standby {
             self.state.flight_phase = FlightPhase::Armed;
             self.state.last_state_time = now;
@@ -161,9 +162,9 @@ impl FlightStateMachine {
             self.state.diagnostics_queue.push(format!("Flight phase transition: {:?} -> {:?}", old_phase, self.state.flight_phase));
         }
         
-        // Centralized scheduling for Navigation planner (1 Hz)
+        // Centralized scheduling for Guidance planner (1 Hz)
         if Self::due(self.state.last_navigation_update, now, self.navigation_rate) {
-            self.update_navigation(now);
+            self.update_guidance(now);
         }
         
         // Centralized scheduling for MPC (50 Hz)
@@ -201,7 +202,8 @@ impl FlightStateMachine {
         true
     }
     
-    fn update_navigation(&mut self, now: f64) {
+    // Trajectory generation and guidance re-planning (1 Hz)
+    fn update_guidance(&mut self, now: f64) {
         match self.state.flight_phase {
             FlightPhase::Standby | FlightPhase::Armed => {
                 if self.state.trajectory_state.is_none() {
@@ -209,17 +211,15 @@ impl FlightStateMachine {
                 }
             }
             FlightPhase::Ascent => {
-                if self.state.trajectory_state.is_none() {
-                    self.generate_ascent_trajectory(now);
-                }
+                // Dynamically re-plan trajectory from current EKF state to hover target
+                self.generate_ascent_trajectory(now);
             }
             FlightPhase::Hover => {
                 self.state.trajectory_state = None;
             }
             FlightPhase::Descent => {
-                if self.state.trajectory_state.is_none() {
-                    self.generate_descent_trajectory(now);
-                }
+                // Dynamically re-plan trajectory from current EKF state to landing target
+                self.generate_descent_trajectory(now);
             }
             FlightPhase::Landed => {
                 self.state.trajectory_state = None;
@@ -285,9 +285,21 @@ impl FlightStateMachine {
         let current_altitude = self.state.vehicle_state.position.z;
         let goal_altitude = goal_position[2];
 
+        // Emergency landing contingency check on GPS/UWB sensor denial
+        // TODO: Intergrate this into the contigencies or into the flight_phase transitions below. Kinda sticks out right now
+        if self.state.flight_phase == FlightPhase::Ascent || self.state.flight_phase == FlightPhase::Hover {
+            if self.state.last_position_update > 0.0 && now - self.state.last_position_update > 5.0 {
+                let msg = format!("Emergency landing triggered: absolute position data (GPS/UWB) denied for {:.2}s", now - self.state.last_position_update);
+                self.state.diagnostics_queue.push(msg.clone());
+                println!("{}", msg);
+                self.state.last_state_time = now;
+                return FlightPhase::Descent;
+            }
+        }
+
         match self.state.flight_phase {
             FlightPhase::Ascent => {
-                if current_altitude >= goal_altitude * 0.95 {
+                if current_altitude >= goal_altitude {
                     self.state.last_state_time = now;
                     FlightPhase::Hover
                 } else {
@@ -370,10 +382,12 @@ impl FlightStateMachine {
             return Some("IMU data missing".to_string());
         }
         
+        // TODO: Decide if we want to keep this block or not, we already shifted to dead reckoning and landing, if we don't trust IMU at all we can just cut off, makes sense
         if sensor_data.uwb_data.is_none() && sensor_data.gps_data.is_none() {
             let elapsed_since_pos = now - self.state.last_position_update;
-            if elapsed_since_pos > 5.0 {
-                return Some(format!("No GPS or UWB position data for {:.2}s", elapsed_since_pos));
+            // TODO: Probably want to get some more realistic numbers of how bad we think the IMU would drift in a given amount of time to decide the amount of error we want to permit
+            if elapsed_since_pos > 15.0 {
+                return Some(format!("No GPS or UWB position data for {:.2}s (exceeded dead-reckoning safety limit)", elapsed_since_pos));
             }
         }
         
