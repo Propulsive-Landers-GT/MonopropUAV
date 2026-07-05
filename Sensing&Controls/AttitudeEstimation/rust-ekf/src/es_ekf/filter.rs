@@ -26,24 +26,39 @@ impl<T: ESEKFModel> ErrorStateKalmanFilter<T> {
 
     /// Fast loop: integrate IMU data forward
     pub fn predict(&mut self, imu_data: &[f64], dt: f64) {
-        // 1. Advance the nominal state non-linearly
-        self.nominal_state = self.model.nominal_prediction(&self.nominal_state, imu_data, dt);
-
-        // 2. Advance the error covariance linearly
+        // 1. Linearize the error dynamics about the state at the START of the
+        // step (the same state the nonlinear prediction integrates from).
         let f = self.model.error_transition_jacobian(&self.nominal_state, imu_data, dt);
 
-        // TODO(process-noise): `process_noise` is added raw here. For a physically
-        // scaled filter, discretize the continuous IMU noise and scale by dt
-        // (e.g. Q_d = G Q_c G^T * dt) instead of using a constant Q.
+        // 2. Advance the nominal state non-linearly
+        self.nominal_state = self.model.nominal_prediction(&self.nominal_state, imu_data, dt);
+
+        // 3. Advance the error covariance linearly. `process_noise` must be
+        // the DISCRETE Q for this dt (see RocketState::process_noise, which
+        // scales the datasheet noise densities by the sample period).
         self.error_covariance = f.dot(&self.error_covariance).dot(&f.t()) + &self.process_noise;
     }
 
-    /// Slow loop: apply measurement (e.g., GPS, UWB) to update and inject errors
+    /// Slow loop: apply the model's default measurement (e.g., GPS position)
+    /// to update and inject errors
     pub fn update(&mut self, measurement: &Array1<f64>, r_matrix: &Array2<f64>) {
         let prediction = self.model.measurement_prediction(&self.nominal_state);
-        let residual = measurement - &prediction;
-
         let h = self.model.measurement_jacobian(&self.nominal_state);
+        self.update_with(measurement, &prediction, &h, r_matrix);
+    }
+
+    /// Apply an arbitrary linearized measurement given its predicted value and
+    /// Jacobian with respect to the error state. This lets callers fuse
+    /// additional sensors beyond the model's default measurement (e.g., a
+    /// magnetometer for yaw observability) without changing the model trait.
+    pub fn update_with(
+        &mut self,
+        measurement: &Array1<f64>,
+        prediction: &Array1<f64>,
+        h: &Array2<f64>,
+        r_matrix: &Array2<f64>,
+    ) {
+        let residual = measurement - prediction;
 
         // S = H * P * H^T + R
         let s = h.dot(&self.error_covariance).dot(&h.t()) + r_matrix;
@@ -72,7 +87,7 @@ impl<T: ESEKFModel> ErrorStateKalmanFilter<T> {
 
         // P = (I - K * H) * P
         let identity = Array2::eye(self.error_covariance.nrows());
-        self.error_covariance = (identity - k.dot(&h)).dot(&self.error_covariance);
+        self.error_covariance = (identity - k.dot(h)).dot(&self.error_covariance);
 
         // TODO(covariance-reset): after injecting the attitude error, the error frame
         // rotates. A rigorous ES-EKF applies P <- G P G^T with

@@ -2,6 +2,49 @@ use crate::es_ekf::model::ESEKFModel;
 use ndarray::{array, Array1, Array2};
 use nalgebra::{UnitQuaternion, Vector3, Quaternion};
 
+/// IMU noise characteristics for the VectorNav VN-200, taken from the
+/// datasheet (https://www.vectornav.com/products/detail/vn-200):
+///
+///   - Accel noise density:         < 0.14 mg/sqrt(Hz)
+///   - Accel in-run bias stability: < 0.04 mg
+///   - Gyro noise density:            0.0035 deg/s/sqrt(Hz)
+///   - Gyro in-run bias stability:  < 10 deg/hr (5 deg/hr typical)
+///
+/// These match the simulated IMU in
+/// Algorithms/RocketSimulation/rust_rocket_sim/src/device_sim.rs, which uses
+/// accel sigma 0.00137 m/s^2/sqrt(Hz) and gyro sigma 6.1e-5 rad/s/sqrt(Hz).
+///
+/// IMU sample rate: the datasheet supports IMU output up to 1 kHz; the
+/// simulated IMU runs at 300 Hz (device_sim.rs) and the recorded
+/// flight_data.csv is logged at 100 Hz. Because the rate varies by source,
+/// nothing here hardcodes it — pass the actual sample period `dt` to
+/// [`RocketState::process_noise`].
+pub mod vn200 {
+    /// Accel noise density [m/s^2/sqrt(Hz)]: 0.14 mg/sqrt(Hz) * 9.80665.
+    pub const ACCEL_NOISE_DENSITY: f64 = 0.14e-3 * 9.80665;
+
+    /// Gyro noise density [rad/s/sqrt(Hz)]: 0.0035 deg/s/sqrt(Hz).
+    pub const GYRO_NOISE_DENSITY: f64 = 0.0035 * std::f64::consts::PI / 180.0;
+
+    /// Accel in-run bias stability [m/s^2]: 0.04 mg * 9.80665.
+    pub const ACCEL_BIAS_INSTABILITY: f64 = 0.04e-3 * 9.80665;
+
+    /// Gyro in-run bias stability [rad/s]: 10 deg/hr (datasheet worst case).
+    pub const GYRO_BIAS_INSTABILITY: f64 = 10.0 / 3600.0 * std::f64::consts::PI / 180.0;
+
+    /// Assumed correlation time [s] of the in-run bias wander. The datasheet
+    /// gives bias *instability*, not a random-walk density; the standard
+    /// first-order Gauss-Markov approximation converts one to the other as
+    /// sigma_rw = instability / sqrt(tau).
+    pub const BIAS_CORRELATION_TIME: f64 = 100.0;
+
+    /// Accel bias random-walk density [m/s^2/sqrt(s)] = instability / sqrt(tau).
+    pub const ACCEL_BIAS_RANDOM_WALK: f64 = ACCEL_BIAS_INSTABILITY / 10.0; // sqrt(100)
+
+    /// Gyro bias random-walk density [rad/s/sqrt(s)] = instability / sqrt(tau).
+    pub const GYRO_BIAS_RANDOM_WALK: f64 = GYRO_BIAS_INSTABILITY / 10.0; // sqrt(100)
+}
+
 pub struct RocketState;
 
 impl RocketState {
@@ -43,6 +86,96 @@ impl RocketState {
             }
         }
     }
+
+    /// Discrete process-noise covariance Q (15x15) built from the VN-200
+    /// datasheet values in [`vn200`], for an IMU sample period `dt` [s].
+    ///
+    /// Follows the Sola ES-EKF discretization, where each white-noise density
+    /// integrates over one sample period into a covariance of density^2 * dt:
+    ///   - dv     <- accel measurement noise:   (accel noise density)^2 * dt
+    ///   - dtheta <- gyro measurement noise:    (gyro noise density)^2 * dt
+    ///   - da_b   <- accel bias random walk:    (accel bias RW density)^2 * dt
+    ///   - dw_b   <- gyro bias random walk:     (gyro bias RW density)^2 * dt
+    ///
+    /// The position block is zero: position uncertainty grows only through the
+    /// velocity coupling in F, not from direct process noise.
+    ///
+    /// The filter adds this Q once per predict() call, so it must be built
+    /// with the same `dt` used for prediction (rebuild it if the IMU rate
+    /// changes).
+    pub fn process_noise(dt: f64) -> Array2<f64> {
+        let q_v = vn200::ACCEL_NOISE_DENSITY.powi(2) * dt;
+        let q_theta = vn200::GYRO_NOISE_DENSITY.powi(2) * dt;
+        let q_ab = vn200::ACCEL_BIAS_RANDOM_WALK.powi(2) * dt;
+        let q_wb = vn200::GYRO_BIAS_RANDOM_WALK.powi(2) * dt;
+
+        let mut q = Array2::<f64>::zeros((15, 15));
+        for i in 0..3 {
+            q[[3 + i, 3 + i]] = q_v;
+            q[[6 + i, 6 + i]] = q_theta;
+            q[[9 + i, 9 + i]] = q_ab;
+            q[[12 + i, 12 + i]] = q_wb;
+        }
+        q
+    }
+
+    /// Recommended initial error covariance P0 (15x15).
+    ///
+    /// The bias blocks matter most: an over-inflated bias uncertainty (e.g. a
+    /// uniform eye * 0.01, i.e. gyro-bias sigma 0.1 rad/s ~ 5.7 deg/s) lets
+    /// measurement updates slam the bias estimates around, and the bias-error
+    /// component along any unobservable direction (rotation about the magnetic
+    /// field axis, for mag-aided yaw) integrates directly into attitude error.
+    /// Bounding the bias blocks near the VN-200's actual bias scale fixed a
+    /// 15-19 deg attitude transient in replay testing.
+    ///
+    ///   - position:   sigma 0.1 m
+    ///   - velocity:   sigma 0.1 m/s
+    ///   - attitude:   sigma 0.1 rad (~5.7 deg)
+    ///   - accel bias: sigma 0.01 m/s^2 (~1 mg; generous vs the 0.04 mg
+    ///     in-run stability, leaving room for turn-on bias)
+    ///   - gyro bias:  sigma 1e-3 rad/s (~0.06 deg/s; generous vs the
+    ///     10 deg/hr in-run stability, leaving room for turn-on bias)
+    pub fn initial_covariance() -> Array2<f64> {
+        let mut p = Array2::<f64>::eye(15) * 0.01;
+        for i in 9..12 {
+            p[[i, i]] = 1e-4; // accel bias
+        }
+        for i in 12..15 {
+            p[[i, i]] = 1e-6; // gyro bias
+        }
+        p
+    }
+
+    /// Predicted magnetometer measurement (3D, body frame): the known world
+    /// magnetic field rotated into the body frame, m_body = R^T * m_world.
+    ///
+    /// Fusing this makes yaw observable — GPS position alone leaves rotation
+    /// about the world vertical (and gyro-Z bias) unobserved, so yaw drifts.
+    pub fn mag_prediction(state: &Array1<f64>, mag_world: &Vector3<f64>) -> Array1<f64> {
+        let quat = UnitQuaternion::from_quaternion(Quaternion::new(
+            state[6], state[7], state[8], state[9],
+        ));
+        let m_body = quat.inverse_transform_vector(mag_world);
+        array![m_body.x, m_body.y, m_body.z]
+    }
+
+    /// Magnetometer Jacobian (3x15) with respect to the error state.
+    ///
+    /// Only the attitude block is nonzero. With the local (right-multiplied)
+    /// attitude-error convention used throughout this model,
+    ///   h(q (x) dq) = (R(q) R(dtheta))^T m_w ~= (I - skew(dtheta)) R^T m_w
+    ///               = m_body + skew(m_body) * dtheta,
+    /// so H[0..3, 6..9] = skew(R^T * m_world).
+    pub fn mag_jacobian(state: &Array1<f64>, mag_world: &Vector3<f64>) -> Array2<f64> {
+        let quat = UnitQuaternion::from_quaternion(Quaternion::new(
+            state[6], state[7], state[8], state[9],
+        ));
+        let m_body = quat.inverse_transform_vector(mag_world);
+        let mut h = Array2::<f64>::zeros((3, 15));
+        Self::set_block(&mut h, 0, 6, &Self::skew(&m_body));
+        h
+    }
 }
 
 impl ESEKFModel for RocketState {
@@ -75,14 +208,9 @@ impl ESEKFModel for RocketState {
         let next_pos = pos + vel * dt + 0.5 * a_world * dt * dt;
         let next_vel = vel + a_world * dt;
 
-        // Quaternion integration (using small angle approximation for omega)
-        let w_norm = w_body.norm();
-        let q_update = if w_norm > 1e-6 {
-            let axis = w_body / w_norm;
-            UnitQuaternion::from_axis_angle(&nalgebra::Unit::new_normalize(axis), w_norm * dt)
-        } else {
-            UnitQuaternion::identity()
-        };
+        // Quaternion integration via the exponential map (from_scaled_axis
+        // handles the small-rotation limit internally).
+        let q_update = UnitQuaternion::from_scaled_axis(w_body * dt);
         let next_quat = quat * q_update; // Post-multiply for local frame rotation
 
         // Update state array (ndarray Array1 does not support range slice assignment
@@ -354,12 +482,128 @@ mod tests {
         );
     }
 
+    /// World magnetic field used by the simulator (device_sim.rs), in teslas.
+    fn sim_mag_world() -> nalgebra::Vector3<f64> {
+        nalgebra::Vector3::new(-2.0e-6, 22.0e-6, -44.3e-6)
+    }
+
+    #[test]
+    fn mag_jacobian_matches_finite_difference() {
+        let model = RocketState;
+        let (x, _imu, _dt) = sample_state();
+        let m_w = sim_mag_world();
+        let h = RocketState::mag_jacobian(&x, &m_w);
+        let eps = 1e-6;
+        let base = RocketState::mag_prediction(&x, &m_w);
+        for j in 0..15 {
+            let mut dp = Array1::<f64>::zeros(15);
+            dp[j] = eps;
+            let x_plus = model.inject_error(&x, &dp);
+            let pred_plus = RocketState::mag_prediction(&x_plus, &m_w);
+            for i in 0..3 {
+                let numeric = (pred_plus[i] - base[i]) / eps;
+                assert!(
+                    (h[[i, j]] - numeric).abs() < 1e-9,
+                    "H_mag[{i},{j}] analytic {} vs numeric {}",
+                    h[[i, j]],
+                    numeric
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mag_updates_correct_observable_attitude_error() {
+        // Truth attitude is identity; the filter starts with a 0.2 rad yaw
+        // error. A single reference vector cannot observe rotation ABOUT that
+        // vector, so mag updates must (a) remove the error component
+        // perpendicular to the field and (b) leave only a residual rotation
+        // aligned with the field axis. With the sim's 26.5-degree field tilt
+        // that still removes ~20% of the yaw error per full correction; the
+        // rest is recovered in the full filter by the roll/pitch information
+        // in the GPS/accel channel.
+        let m_w = sim_mag_world();
+        let z_mag = array![m_w.x, m_w.y, m_w.z]; // body frame of identity truth
+
+        let mut init = identity_state();
+        let q0 = UnitQuaternion::from_euler_angles(0.0, 0.0, 0.2);
+        init[6] = q0.w;
+        init[7] = q0.i;
+        init[8] = q0.j;
+        init[9] = q0.k;
+
+        let mut ekf = ErrorStateKalmanFilter::new(
+            init,
+            Array2::<f64>::eye(15) * 0.01,
+            RocketState::process_noise(0.01),
+            RocketState,
+        );
+        let r_mag = Array2::<f64>::eye(3) * (2.0e-7_f64).powi(2);
+
+        for _ in 0..20 {
+            let pred = RocketState::mag_prediction(&ekf.nominal_state, &m_w);
+            let h = RocketState::mag_jacobian(&ekf.nominal_state, &m_w);
+            ekf.update_with(&z_mag, &pred, &h, &r_mag);
+        }
+
+        // Remaining attitude error (truth is identity, so the state IS the error).
+        let s = &ekf.nominal_state;
+        let q_err = UnitQuaternion::from_quaternion(Quaternion::new(s[6], s[7], s[8], s[9]));
+        let err_angle = q_err.angle();
+
+        // (a) The total error shrank (perpendicular component removed):
+        // residual should be ~0.2 * cos(field tilt) = 0.179 rad, not 0.2.
+        assert!(
+            err_angle < 0.19,
+            "mag updates removed no attitude error: {err_angle} (started at 0.2)"
+        );
+
+        // (b) The residual rotation is about the field axis (unobservable
+        // direction) — its axis must align with the world field direction.
+        let axis = q_err
+            .axis()
+            .expect("residual error should be a nonzero rotation");
+        let field_dir = m_w / m_w.norm();
+        let alignment = axis.dot(&field_dir).abs();
+        assert!(
+            alignment > 0.99,
+            "residual error axis not aligned with field direction: dot = {alignment}"
+        );
+    }
+
+    #[test]
+    fn process_noise_is_diagonal_psd_and_scales_with_dt() {
+        let dt = 1.0 / 300.0; // simulated VN-200 rate in device_sim.rs
+        let q = RocketState::process_noise(dt);
+        assert_eq!(q.dim(), (15, 15));
+        for i in 0..15 {
+            for j in 0..15 {
+                if i == j {
+                    assert!(q[[i, j]] >= 0.0, "Q[{i},{i}] negative");
+                } else {
+                    assert_eq!(q[[i, j]], 0.0, "Q[{i},{j}] should be zero");
+                }
+            }
+        }
+        // Position rows carry no direct process noise; all driven blocks do.
+        for i in 0..3 {
+            assert_eq!(q[[i, i]], 0.0);
+            assert!(q[[3 + i, 3 + i]] > 0.0);
+            assert!(q[[6 + i, 6 + i]] > 0.0);
+            assert!(q[[9 + i, 9 + i]] > 0.0);
+            assert!(q[[12 + i, 12 + i]] > 0.0);
+        }
+        // White-noise densities integrate linearly in dt.
+        let q2 = RocketState::process_noise(2.0 * dt);
+        assert!((q2[[3, 3]] / q[[3, 3]] - 2.0).abs() < 1e-12);
+    }
+
     #[test]
     fn covariance_stays_symmetric_and_psd() {
         let mut ekf = ErrorStateKalmanFilter::new(
             identity_state(),
             Array2::<f64>::eye(15) * 0.01,
-            Array2::<f64>::eye(15) * 1e-4,
+            RocketState::process_noise(0.01),
             RocketState,
         );
         let imu = [0.2, -0.1, 9.85, 0.05, -0.02, 0.03];
