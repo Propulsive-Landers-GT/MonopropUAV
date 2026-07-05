@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV = os.path.join(HERE, "esekf_output.csv")
+OUT_DIR = os.path.join(HERE, "outputs")
 FLIGHT_CSV = os.path.join(HERE, "flight_data.csv")
 
 
@@ -71,7 +72,8 @@ def main():
     ax[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    inputs_path = os.path.join(HERE, "esekf_inputs.png")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    inputs_path = os.path.join(OUT_DIR, "esekf_inputs.png")
     fig.savefig(inputs_path, dpi=120)
 
     # ---- Figure 2: OUTPUTS (estimated nominal state) ----
@@ -106,7 +108,7 @@ def main():
     ax[2].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    outputs_path = os.path.join(HERE, "esekf_outputs.png")
+    outputs_path = os.path.join(OUT_DIR, "esekf_outputs.png")
     fig.savefig(outputs_path, dpi=120)
 
     print("wrote", inputs_path)
@@ -156,7 +158,7 @@ def main():
     ax[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    verify_path = os.path.join(HERE, "esekf_attitude_error.png")
+    verify_path = os.path.join(OUT_DIR, "esekf_attitude_error.png")
     fig.savefig(verify_path, dpi=120)
     print("wrote", verify_path)
     print(f"attitude error vs reference: RMS={rms:.3f} deg, peak={peak:.3f} deg, final={final:.3f} deg")
