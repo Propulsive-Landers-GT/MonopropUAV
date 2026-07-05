@@ -1,6 +1,6 @@
 # Rust Extended Kalman Filter (EKF) Library
 
-A Rust implementation of the Extended Kalman Filter. This library provides a generic EKF implementation along with specific models for attitude, altitude, and position estimation.
+A Rust implementation of the Extended Kalman Filter. This library provides a generic EKF implementation along with specific models for attitude, altitude, and position estimation. It also includes an Error-State EKF (ES-EKF) for full 15-state inertial navigation with quaternion attitude.
 
 ## Features
 
@@ -9,21 +9,30 @@ A Rust implementation of the Extended Kalman Filter. This library provides a gen
   - **Altitude Estimation**: For vertical position and velocity estimation
   - **Attitude Estimation**: For orientation estimation
   - **XY Position**: For 2D position tracking
+- **Error-State EKF (ES-EKF)**: A quaternion-based error-state filter for full inertial navigation (position, velocity, attitude, and IMU biases). Avoids the gimbal-lock and unit-norm problems of the Euler-angle EKF. See [ES_EKF.md](ES_EKF.md) for the full theory, math, and usage.
 
 ## Project Structure
 
 ```
 src/
-├── lib.rs              # Library root and public API
+├── lib.rs                   # Library root and public API
 ├── ekf/
-│   ├── mod.rs         # EKF module exports
-│   ├── filter.rs      # Core EKF implementation
-│   └── model.rs       # EKFModel trait definition
-└── models/            # Pre-built EKF models
-    ├── mod.rs         # Model exports and type aliases
-    ├── altitude.rs    # Altitude estimation model
-    ├── attitude.rs    # Attitude estimation model
-    └── xy_position.rs # 2D position tracking model
+│   ├── mod.rs               # EKF module exports
+│   ├── filter.rs            # Core EKF implementation
+│   └── model.rs             # EKFModel trait definition
+├── es_ekf/                  # Error-State EKF (see ES_EKF.md)
+│   ├── mod.rs               # ES-EKF module exports
+│   ├── filter.rs            # ErrorStateKalmanFilter implementation
+│   └── model.rs             # ESEKFModel trait definition
+├── models/                  # Pre-built models
+│   ├── mod.rs               # Model exports and type aliases
+│   ├── altitude.rs          # Altitude estimation model
+│   ├── attitude.rs          # Attitude estimation model
+│   ├── xy_position.rs       # 2D position tracking model
+│   └── full_state_esekf.rs  # RocketState: 15-state INS model for the ES-EKF
+└── testing/
+    ├── attitude_test.rs     # Attitude EKF driver (binary: attitude_test)
+    └── esekf_test.rs        # ES-EKF smoke-test driver (binary: esekf_test)
 ```
 
 ## Core Components
@@ -207,6 +216,26 @@ loop {
 }
 ```
 
+## Error-State EKF (ES-EKF)
+
+For full inertial navigation (position, velocity, quaternion attitude, and accel/gyro
+biases) the library provides a separate **Error-State EKF** in `src/es_ekf/`, with the
+`RocketState` model in `src/models/full_state_esekf.rs`.
+
+Unlike the Euler-angle `AttitudeModel`, the ES-EKF tracks attitude as a unit quaternion
+in a 16D **nominal state** while running the Kalman filter on a minimal 15D **error
+state** (`[dp, dv, dtheta, da_b, dw_b]`). This avoids gimbal lock and the quaternion
+unit-norm / singular-covariance issues of a direct EKF.
+
+- Fast loop: `predict(&imu, dt)` integrates accel + gyro every step.
+- Slow loop: `update(&gps, &r)` fuses a GPS position fix when available.
+- Convenience alias: `RocketESEKF = ErrorStateKalmanFilter<RocketState>`.
+
+Run the smoke-test driver with `cargo run --bin esekf_test`.
+
+See **[ES_EKF.md](ES_EKF.md)** for the full theory, the math and its code mapping,
+usage examples, current limitations, and the roadmap to a production implementation.
+
 ## Model Tuning Tips
 
 1. **Process Noise Covariance (Q)**:
@@ -257,3 +286,4 @@ pub type MyCustomEKF = crate::ekf::filter::ExtendedKalmanFilter<MyCustomModel>;
 - [Wikipedia: Extended Kalman Filter](https://en.wikipedia.org/wiki/Extended_Kalman_filter)
 - [Math Behind EKF](https://www.alanzucconi.com/2022/07/24/extended-kalman-filter/)
 - [EKF for Attitude Estimation](https://ahrs.readthedocs.io/en/latest/filters/ekf.html)
+- [Joan Sola, "Quaternion kinematics for the error-state Kalman filter"](https://arxiv.org/abs/1711.02508) (basis for the ES-EKF; see [ES_EKF.md](ES_EKF.md))

@@ -31,7 +31,10 @@ impl<T: ESEKFModel> ErrorStateKalmanFilter<T> {
 
         // 2. Advance the error covariance linearly
         let f = self.model.error_transition_jacobian(&self.nominal_state, imu_data, dt);
-        
+
+        // TODO(process-noise): `process_noise` is added raw here. For a physically
+        // scaled filter, discretize the continuous IMU noise and scale by dt
+        // (e.g. Q_d = G Q_c G^T * dt) instead of using a constant Q.
         self.error_covariance = f.dot(&self.error_covariance).dot(&f.t()) + &self.process_noise;
     }
 
@@ -70,5 +73,10 @@ impl<T: ESEKFModel> ErrorStateKalmanFilter<T> {
         // P = (I - K * H) * P
         let identity = Array2::eye(self.error_covariance.nrows());
         self.error_covariance = (identity - k.dot(&h)).dot(&self.error_covariance);
+
+        // TODO(covariance-reset): after injecting the attitude error, the error frame
+        // rotates. A rigorous ES-EKF applies P <- G P G^T with
+        // G = blockdiag(I, I, I - 0.5*skew(dtheta), I, I). Omitted here because the
+        // correction is small; add if attitude corrections become large.
     }
 }
