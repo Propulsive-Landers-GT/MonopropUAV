@@ -176,6 +176,23 @@ impl RocketState {
         Self::set_block(&mut h, 0, 6, &Self::skew(&m_body));
         h
     }
+
+    /// Predicted barometric altitude (1D): world-Z position. The VN-200's
+    /// onboard pressure sensor reports pressure altitude; with the absolute
+    /// bias (+/-1.5 mbar error band) zeroed at the pad, it measures p_z
+    /// directly. Unlike GPS/UWB it needs no radio, so it keeps bounding
+    /// vertical drift through a GNSS outage.
+    pub fn baro_prediction(state: &Array1<f64>) -> Array1<f64> {
+        array![state[2]]
+    }
+
+    /// Barometer Jacobian (1x15) with respect to the error state: the
+    /// measurement is world-Z position, so only H[0, dp_z] is nonzero.
+    pub fn baro_jacobian() -> Array2<f64> {
+        let mut h = Array2::<f64>::zeros((1, 15));
+        h[[0, 2]] = 1.0;
+        h
+    }
 }
 
 impl ESEKFModel for RocketState {
@@ -336,7 +353,7 @@ impl ESEKFModel for RocketState {
 #[cfg(test)]
 mod tests {
     use super::RocketState;
-    use crate::es_ekf::filter::ErrorStateKalmanFilter;
+    use crate::es_ekf::filter::{ErrorStateKalmanFilter, UpdateOutcome};
     use crate::es_ekf::model::ESEKFModel;
     use nalgebra::{Quaternion, UnitQuaternion};
     use ndarray::{array, Array1, Array2};
@@ -513,6 +530,28 @@ mod tests {
     }
 
     #[test]
+    fn baro_jacobian_matches_finite_difference() {
+        let model = RocketState;
+        let (x, _imu, _dt) = sample_state();
+        let h = RocketState::baro_jacobian();
+        let eps = 1e-6;
+        let base = RocketState::baro_prediction(&x);
+        for j in 0..15 {
+            let mut dp = Array1::<f64>::zeros(15);
+            dp[j] = eps;
+            let x_plus = model.inject_error(&x, &dp);
+            let pred_plus = RocketState::baro_prediction(&x_plus);
+            let numeric = (pred_plus[0] - base[0]) / eps;
+            assert!(
+                (h[[0, j]] - numeric).abs() < 1e-9,
+                "H_baro[0,{j}] analytic {} vs numeric {}",
+                h[[0, j]],
+                numeric
+            );
+        }
+    }
+
+    #[test]
     fn mag_updates_correct_observable_attitude_error() {
         // Truth attitude is identity; the filter starts with a 0.2 rad yaw
         // error. A single reference vector cannot observe rotation ABOUT that
@@ -655,6 +694,63 @@ mod tests {
         assert!(
             trace_after <= trace_before + 1e-9,
             "covariance trace grew after a measurement update: {trace_before} -> {trace_after}"
+        );
+    }
+
+    #[test]
+    fn non_finite_imu_and_measurements_are_rejected() {
+        let mut ekf = ErrorStateKalmanFilter::new(
+            identity_state(),
+            RocketState::initial_covariance(),
+            RocketState::process_noise(0.01),
+            RocketState,
+        );
+
+        // NaN in the IMU sample: predict must refuse and leave state untouched.
+        let state_before = ekf.nominal_state.clone();
+        let bad_imu = [0.0, f64::NAN, 9.81, 0.0, 0.0, 0.0];
+        assert!(!ekf.predict(&bad_imu, 0.01), "NaN IMU sample was accepted");
+        assert!(!ekf.predict(&[0.0; 6], f64::NAN), "NaN dt was accepted");
+        assert_eq!(ekf.nominal_state, state_before);
+
+        // NaN in a measurement: update must refuse and leave state untouched.
+        let r = Array2::<f64>::eye(3) * 1.0;
+        let outcome = ekf.update(&array![f64::NAN, 0.0, 0.0], &r);
+        assert_eq!(outcome, UpdateOutcome::RejectedNonFinite);
+        assert_eq!(ekf.nominal_state, state_before);
+        assert!(ekf.nominal_state.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn innovation_gate_rejects_outliers_and_passes_normal_measurements() {
+        let mut ekf = ErrorStateKalmanFilter::new(
+            identity_state(),
+            RocketState::initial_covariance(),
+            RocketState::process_noise(0.01),
+            RocketState,
+        );
+        let imu = [0.0, 0.0, 9.81, 0.0, 0.0, 0.0];
+        ekf.predict(&imu, 0.01);
+
+        let r = Array2::<f64>::eye(3) * 1.0;
+        let h = ekf.model.measurement_jacobian(&ekf.nominal_state);
+        let gate = Some(16.27); // chi-square 99.9%, 3 DOF
+
+        // A wildly wrong position (the "300000" firmware glitch) must be gated out.
+        let pred = ekf.model.measurement_prediction(&ekf.nominal_state);
+        let state_before = ekf.nominal_state.clone();
+        let outcome = ekf.update_gated(&array![3.0e5, -3.0e5, 3.0e5], &pred, &h, &r, gate);
+        assert!(
+            matches!(outcome, UpdateOutcome::RejectedGate { .. }),
+            "outlier was fused: {outcome:?}"
+        );
+        assert_eq!(ekf.nominal_state, state_before);
+
+        // A statistically ordinary measurement must still be fused.
+        let outcome = ekf.update_gated(&array![0.1, -0.1, 0.05], &pred, &h, &r, gate);
+        assert!(
+            matches!(outcome, UpdateOutcome::Fused { .. }),
+            "normal measurement was rejected: {outcome:?}"
         );
     }
 }

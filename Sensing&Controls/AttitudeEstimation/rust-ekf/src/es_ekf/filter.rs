@@ -2,6 +2,23 @@ use crate::es_ekf::model::ESEKFModel;
 use nalgebra::DMatrix;
 use ndarray::{Array1, Array2};
 
+/// What happened to a measurement handed to the filter. A single filter is
+/// expected to ride through sensor faults on its own (dropouts, outliers,
+/// NaNs from firmware), so rejected measurements are a normal, reportable
+/// outcome rather than a panic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UpdateOutcome {
+    /// Measurement fused; `nis` is the normalized innovation squared
+    /// (Mahalanobis distance of the residual), useful for consistency checks.
+    Fused { nis: f64 },
+    /// Measurement contained NaN/Inf and was ignored.
+    RejectedNonFinite,
+    /// Innovation failed the chi-square gate and was ignored.
+    RejectedGate { nis: f64 },
+    /// Innovation covariance S was singular; measurement ignored.
+    RejectedSingular,
+}
+
 pub struct ErrorStateKalmanFilter<T: ESEKFModel> {
     pub nominal_state: Array1<f64>,
     pub error_covariance: Array2<f64>, // Size of Error State (e.g., 15x15)
@@ -24,8 +41,14 @@ impl<T: ESEKFModel> ErrorStateKalmanFilter<T> {
         }
     }
 
-    /// Fast loop: integrate IMU data forward
-    pub fn predict(&mut self, imu_data: &[f64], dt: f64) {
+    /// Fast loop: integrate IMU data forward. Returns false (and leaves the
+    /// state untouched) if the IMU sample or dt is non-finite — a NaN here
+    /// would otherwise poison the whole state vector in one step.
+    pub fn predict(&mut self, imu_data: &[f64], dt: f64) -> bool {
+        if !dt.is_finite() || dt <= 0.0 || imu_data.iter().any(|v| !v.is_finite()) {
+            return false;
+        }
+
         // 1. Linearize the error dynamics about the state at the START of the
         // step (the same state the nonlinear prediction integrates from).
         let f = self.model.error_transition_jacobian(&self.nominal_state, imu_data, dt);
@@ -37,14 +60,15 @@ impl<T: ESEKFModel> ErrorStateKalmanFilter<T> {
         // the DISCRETE Q for this dt (see RocketState::process_noise, which
         // scales the datasheet noise densities by the sample period).
         self.error_covariance = f.dot(&self.error_covariance).dot(&f.t()) + &self.process_noise;
+        true
     }
 
     /// Slow loop: apply the model's default measurement (e.g., GPS position)
     /// to update and inject errors
-    pub fn update(&mut self, measurement: &Array1<f64>, r_matrix: &Array2<f64>) {
+    pub fn update(&mut self, measurement: &Array1<f64>, r_matrix: &Array2<f64>) -> UpdateOutcome {
         let prediction = self.model.measurement_prediction(&self.nominal_state);
         let h = self.model.measurement_jacobian(&self.nominal_state);
-        self.update_with(measurement, &prediction, &h, r_matrix);
+        self.update_with(measurement, &prediction, &h, r_matrix)
     }
 
     /// Apply an arbitrary linearized measurement given its predicted value and
@@ -57,7 +81,30 @@ impl<T: ESEKFModel> ErrorStateKalmanFilter<T> {
         prediction: &Array1<f64>,
         h: &Array2<f64>,
         r_matrix: &Array2<f64>,
-    ) {
+    ) -> UpdateOutcome {
+        self.update_gated(measurement, prediction, h, r_matrix, None)
+    }
+
+    /// Like `update_with`, but with an optional chi-square gate on the
+    /// normalized innovation squared (NIS = r^T S^-1 r). A measurement whose
+    /// NIS exceeds `gate` is statistically inconsistent with the filter's own
+    /// uncertainty (wild outlier, stuck sensor, wrong frame) and is dropped
+    /// instead of fused. For a 3D measurement, gate = 16.27 keeps 99.9% of
+    /// genuine measurements (chi-square, 3 degrees of freedom).
+    pub fn update_gated(
+        &mut self,
+        measurement: &Array1<f64>,
+        prediction: &Array1<f64>,
+        h: &Array2<f64>,
+        r_matrix: &Array2<f64>,
+        gate: Option<f64>,
+    ) -> UpdateOutcome {
+        // Firmware faults show up as NaN/Inf; fusing one would corrupt the
+        // entire state and covariance in a single update.
+        if measurement.iter().any(|v| !v.is_finite()) {
+            return UpdateOutcome::RejectedNonFinite;
+        }
+
         let residual = measurement - prediction;
 
         // S = H * P * H^T + R
@@ -71,10 +118,17 @@ impl<T: ESEKFModel> ErrorStateKalmanFilter<T> {
                 .expect("inverse shape must match"),
             None => {
                 // Prevent panic on singular matrix by adding small diagonal
-                self.error_covariance = &self.error_covariance + &(Array2::<f64>::eye(self.error_covariance.nrows()) * 1e-6); 
-                return;
+                self.error_covariance = &self.error_covariance + &(Array2::<f64>::eye(self.error_covariance.nrows()) * 1e-6);
+                return UpdateOutcome::RejectedSingular;
             }
         };
+
+        let nis = residual.dot(&s_inv.dot(&residual));
+        if let Some(g) = gate {
+            if !nis.is_finite() || nis > g {
+                return UpdateOutcome::RejectedGate { nis };
+            }
+        }
 
         // K = P * H^T * S^-1
         let k = self.error_covariance.dot(&h.t()).dot(&s_inv);
@@ -93,5 +147,7 @@ impl<T: ESEKFModel> ErrorStateKalmanFilter<T> {
         // rotates. A rigorous ES-EKF applies P <- G P G^T with
         // G = blockdiag(I, I, I - 0.5*skew(dtheta), I, I). Omitted here because the
         // correction is small; add if attitude corrections become large.
+
+        UpdateOutcome::Fused { nis }
     }
 }

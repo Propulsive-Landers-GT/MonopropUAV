@@ -14,3 +14,7 @@ path = "src/testing/esekf_test.rs"
 [dependencies]
 ndarray = "0.15"
 nalgebra = "0.32"
+
+[[bin]]
+name = "esekf_fault_test"
+path = "src/testing/esekf_fault_test.rs"
