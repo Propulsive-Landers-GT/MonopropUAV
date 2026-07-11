@@ -1,0 +1,17 @@
+[package]
+name = "Lander"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
+ndarray = "0.15"
+ndarray-linalg = "0.16"
+optimization_engine = "0.6.0"
+rust-ekf = { path = "../Sensing&Controls/AttitudeEstimation/rust-ekf" }
+rust_lossless = { path = "../Algorithms/LosslessConvexification/rust_lossless" }
+MPC = { path = "../Algorithms/MPC" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+mcap = "0.25.0"
+libc = "0.2"

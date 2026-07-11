@@ -34,3 +34,4 @@ Algorithms/MOC/Cargo.lock
 **/target/**
 *.lock
 *.pyc
+*.mcap
