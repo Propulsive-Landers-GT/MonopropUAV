@@ -12,3 +12,4 @@ pub use full_state_esekf::RocketState;
 pub type XYPositionEKF = crate::ekf::filter::ExtendedKalmanFilter<XYPositionModel>;
 pub type AltitudeEKF   = crate::ekf::filter::ExtendedKalmanFilter<AltitudeModel>;
 pub type AttitudeEKF   = crate::ekf::filter::ExtendedKalmanFilter<AttitudeModel>;
+pub type RocketESEKF   = crate::es_ekf::filter::ErrorStateKalmanFilter<RocketState>;

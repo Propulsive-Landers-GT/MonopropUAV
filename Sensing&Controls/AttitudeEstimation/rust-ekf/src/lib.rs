@@ -1,4 +1,5 @@
 pub mod ekf;
+pub mod es_ekf;
 pub mod models;
 
 #[path = "es-ekf/model.rs"]
@@ -12,5 +13,7 @@ pub mod es_ekf {
 }
 
 pub use ekf::*;
+
+pub use es_ekf::{ErrorStateKalmanFilter, ESEKFModel, UpdateOutcome};
 pub use models::*;
-pub use es_ekf::*;
+
