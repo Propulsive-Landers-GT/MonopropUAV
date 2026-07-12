@@ -16,6 +16,10 @@ rand = "0.9"
 rand_distr = "0.5"
 ndarray = "0.15"
 optimization_engine = "0.6.0"
-ndarray-linalg = { version = "0.16", features = ["intel-mkl"] }
+ndarray-linalg = { version = "0.16", features = ["openblas-system"] }
 csv = "1.4.0"
 serde = { version = "1", features = ["derive"] }
+Lander = { path = "../../../Lander" }
+rust_lossless = { path = "../../../Algorithms/LosslessConvexification/rust_lossless" }
+openblas-src = { version = "0.10", features = ["rustls"] }
+

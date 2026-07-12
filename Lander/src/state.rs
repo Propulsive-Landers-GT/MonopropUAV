@@ -18,6 +18,7 @@ pub struct SensorData {
     pub uwb_data: Option<[f64; 3]>,
     pub chamber_pressure: Option<f64>,
     pub tank_pressure: Option<f64>,
+    pub true_attitude: Option<[f64; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]

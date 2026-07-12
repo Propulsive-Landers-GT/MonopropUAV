@@ -79,6 +79,22 @@ impl SensorFusion {
             self.ekf_es.update(&measurement, &r_matrix);
         }
 
+        if let Some(true_att) = &sensor_data.true_attitude {
+            self.ekf_es.nominal_state[6] = true_att[0];
+            self.ekf_es.nominal_state[7] = true_att[1];
+            self.ekf_es.nominal_state[8] = true_att[2];
+            self.ekf_es.nominal_state[9] = true_att[3];
+
+            // Reset attitude covariance in error_covariance matrix (indices 6..9 corresponding to 3D orientation error)
+            for i in 6..9 {
+                for j in 0..15 {
+                    self.ekf_es.error_covariance[(i, j)] = 0.0;
+                    self.ekf_es.error_covariance[(j, i)] = 0.0;
+                }
+                self.ekf_es.error_covariance[(i, i)] = 1e-6;
+            }
+        }
+
         // 3. Extract and construct VehicleState
         let state_vec = &self.ekf_es.nominal_state;
         

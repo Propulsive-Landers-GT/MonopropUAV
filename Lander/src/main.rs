@@ -1,11 +1,6 @@
-mod state;
-mod algorithms;
-mod fsm;
-mod mcap_logger;
-
-use fsm::FlightStateMachine;
-use state::SensorData;
-use mcap_logger::McapLogger;
+use Lander::fsm::FlightStateMachine;
+use Lander::state::SensorData;
+use Lander::mcap_logger::McapLogger;
 use std::sync::mpsc::{self, Receiver};
 
 fn spawn_stdin_channel() -> Receiver<String> {

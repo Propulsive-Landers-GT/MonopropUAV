@@ -1,6 +1,7 @@
 use ndarray::{Array1, Array2};
 extern crate MPC as mpc_crate;
 use super::Controller;
+use crate::state::FlightPhase;
 
 pub struct MPC {
     pub n: usize,
@@ -17,6 +18,8 @@ pub struct MPC {
     pub system_time: f64,
     pub update_rate: f64,
     pub last_solve_time: f64,
+    pub flight_phase: FlightPhase,
+    pub reset_warm_start: bool,
     pub panoc_cache: optimization_engine::panoc::PANOCCache,
 }
 
@@ -38,6 +41,8 @@ impl Clone for MPC {
             system_time: self.system_time,
             update_rate: self.update_rate,
             last_solve_time: self.last_solve_time,
+            flight_phase: self.flight_phase,
+            reset_warm_start: self.reset_warm_start,
             panoc_cache: optimization_engine::panoc::PANOCCache::new(n_dim_u, 1e-4, 20),
         }
     }
@@ -62,23 +67,23 @@ impl MPC {
         let n = 13;
         let m = 3;
         let n_steps = 10;
-        let dt = 0.02;
+        let dt = 0.2;
         
         let q_vec = vec![
-            10.0, 10.0, 80.0,
-            220.0, 220.0, 220.0, 220.0,
-            30.0, 30.0, 10.0,
-            10.0, 10.0, 10.0
+            20.0, 20.0, 70.0,   // position x, y, z
+            6000.0, 6000.0, 6000.0, 0.0, // quaternion qx, qy, qz, qw
+            30.0, 30.0, 50.0,        // linear velocities x_dot, y_dot, z_dot
+            100.0, 100.0, 100.0          // angular velocities wx, wy, wz
         ];
         let q = Array2::<f64>::from_diag(&Array1::from(q_vec));
         
-        let r = Array2::<f64>::from_diag(&Array1::from(vec![5.0, 5.0, 0.05]));
+        let r = Array2::<f64>::from_diag(&Array1::from(vec![50.0, 50.0, 1.0]));
         
         let qn_vec = vec![
-            10.0, 10.0, 80.0,
-            300.0, 300.0, 300.0, 300.0,
-            40.0, 40.0, 20.0,
-            5.0, 5.0, 5.0
+            40.0, 40.0, 80.0,   // position x, y, z
+            10000.0, 10000.0, 10000.0, 0.0, // quaternion qx, qy, qz, qw
+            20.0, 20.0, 100.0,        // linear velocities x_dot, y_dot, z_dot
+            50.0, 50.0, 50.0          // angular velocities wx, wy, wz
         ];
         let qn = Array2::<f64>::from_diag(&Array1::from(qn_vec));
         
@@ -99,6 +104,8 @@ impl MPC {
             system_time: 0.0,
             update_rate: 50.0,
             last_solve_time: 0.0,
+            flight_phase: FlightPhase::Standby,
+            reset_warm_start: false,
             panoc_cache,
         }
     }
@@ -108,45 +115,51 @@ impl MPC {
         self.mass = mass;
         
         let mut u_warm = warm_start.clone();
-        for i in 0..self.n_steps.min(uref_trajectory.len()) {
-            if u_warm[i][2].abs() < 1e-3 || u_warm[i][2] == self.mass * 9.81 {
+        if self.reset_warm_start {
+            self.reset_warm_start = false;
+            for i in 0..self.n_steps.min(uref_trajectory.len()) {
                 u_warm[i] = uref_trajectory[i].clone();
+            }
+        } else {
+            for i in 0..self.n_steps.min(uref_trajectory.len()) {
+                if u_warm[i][2].abs() < 1e-3 {
+                    u_warm[i] = uref_trajectory[i].clone();
+                }
             }
         }
         
-        let smoothing_weight = Array1::from(vec![1500.0, 1500.0, 0.02]);
         let mut moi = Array2::<f64>::zeros((3,3));
-        moi[(0,0)] = 0.5;
-        moi[(1,1)] = 0.5;
-        moi[(2,2)] = 0.8;
+        moi[(0,0)] = 6.65;
+        moi[(1,1)] = 6.65;
+        moi[(2,2)] = 2.3;
         
         let gimbal_limit = 15.0_f64.to_radians();
         let thrust_min = 300.0;
         let thrust_max = self.max_thrust;
+
+        let u_min = Array1::from(vec![-gimbal_limit, -gimbal_limit, thrust_min]);
+        let u_max = Array1::from(vec![gimbal_limit, gimbal_limit, thrust_max]);
         
-        let (_u_apply, u_warm_seq, _debug_info) = mpc_crate::OpEnSolve(
+        let (u_warm_seq, _, u_apply) = mpc_crate::mpc_main(
             current_state,
-            &u_warm,
+            &mut u_warm,
             reference_trajectory,
             &self.q,
             &self.r,
             &self.qn,
-            &smoothing_weight,
-            &mut self.panoc_cache,
+            &u_min,
+            &u_max,
+            3,
+            2e-6,
             self.mass,
             &moi,
-            thrust_min,
-            thrust_max,
-            gimbal_limit,
             self.dt,
         );
         
-        let mut u_opt_vec: Vec<Array1<f64>> = Vec::new();
-        for row in u_warm_seq.axis_iter(ndarray::Axis(0)) {
-            u_opt_vec.push(row.to_owned());
-        }
+        let mut U_optimal = vec![u_apply];
+        U_optimal.extend(u_warm_seq[0..self.n_steps - 1].to_vec());
         
-        Ok(u_opt_vec)
+        Ok(U_optimal)
     }
 }
 
@@ -174,5 +187,58 @@ impl Controller for MPC {
     
     fn get_time_step(&self) -> f64 {
         self.dt
+    }
+
+    fn set_flight_phase(&mut self, phase: FlightPhase) {
+        self.flight_phase = phase;
+        self.reset_warm_start = true;
+        match phase {
+            FlightPhase::Ascent => {
+                self.q = Array2::<f64>::from_diag(&Array1::from(vec![
+                    150.0, 150.0, 600.0,
+                    40000.0, 40000.0, 0.0, 0.0,
+                    100.0, 100.0, 2000.0,
+                    500.0, 500.0, 500.0
+                ]));
+                self.r = Array2::<f64>::from_diag(&Array1::from(vec![50.0, 50.0, 0.005]));
+                self.qn = Array2::<f64>::from_diag(&Array1::from(vec![
+                    150.0, 150.0, 600.0,
+                    50000.0, 50000.0, 0.0, 0.0,
+                    100.0, 100.0, 200.0,
+                    1000.0, 1000.0, 1000.0
+                ]));
+            }
+            FlightPhase::Hover => {
+                self.q = Array2::<f64>::from_diag(&Array1::from(vec![
+                    200.0, 200.0, 800.0,
+                    60000.0, 60000.0, 0.0, 0.0,
+                    100.0, 100.0, 250.0,
+                    500.0, 500.0, 500.0
+                ]));
+                self.r = Array2::<f64>::from_diag(&Array1::from(vec![50.0, 50.0, 1.0]));
+                self.qn = Array2::<f64>::from_diag(&Array1::from(vec![
+                    200.0, 200.0, 1000.0,
+                    100000.0, 100000.0, 0.0, 0.0,
+                    100.0, 100.0, 300.0,
+                    1000.0, 1000.0, 1000.0
+                ]));
+            }
+            FlightPhase::Descent => {
+                self.q = Array2::<f64>::from_diag(&Array1::from(vec![
+                    300.0, 300.0, 800.0,
+                    100000.0, 100000.0, 0.0, 0.0,
+                    100.0, 100.0, 6000.0,
+                    500.0, 500.0, 500.0
+                ]));
+                self.r = Array2::<f64>::from_diag(&Array1::from(vec![50.0, 50.0, 0.005]));
+                self.qn = Array2::<f64>::from_diag(&Array1::from(vec![
+                    150.0, 150.0, 50000.0,
+                    120000.0, 120000.0, 0.0, 0.0,
+                    100.0, 100.0, 200.0,
+                    1000.0, 1000.0, 1000.0
+                ]));
+            }
+            _ => {}
+        }
     }
 }
