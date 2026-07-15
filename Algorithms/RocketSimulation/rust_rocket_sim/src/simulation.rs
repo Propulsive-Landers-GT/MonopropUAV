@@ -163,7 +163,6 @@ impl Simulation {
             },
             chamber_pressure: Some(self.rocket.m2_pt.last_reading.pressure_bar),
             tank_pressure: Some(self.rocket.o_pt.last_reading.pressure_bar),
-            true_attitude: Some([self.rocket.attitude.coords[3], self.rocket.attitude.coords[0], self.rocket.attitude.coords[1], self.rocket.attitude.coords[2]]),
         };
 
         // Step the Flight State Machine

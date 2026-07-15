@@ -147,6 +147,11 @@ impl RocketState {
         p
     }
 
+    /// World magnetic field vector used in the simulation, in the nalgebra version of rust-ekf
+    pub fn mag_world() -> nalgebra::Vector3<f64> {
+        nalgebra::Vector3::new(-2.0e-6, 22.0e-6, -44.3e-6)
+    }
+
     /// Predicted magnetometer measurement (3D, body frame): the known world
     /// magnetic field rotated into the body frame, m_body = R^T * m_world.
     ///
