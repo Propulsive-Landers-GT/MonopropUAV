@@ -3,6 +3,14 @@ name = "Lander"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "Lander"
+path = "src/lib.rs"
+
+[[bin]]
+name = "Lander"
+path = "src/main.rs"
+
 [dependencies]
 nalgebra = { version = "0.33", features = ["serde-serialize"] }
 ndarray = "0.15"

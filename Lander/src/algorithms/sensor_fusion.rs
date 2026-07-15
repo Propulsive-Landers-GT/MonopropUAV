@@ -21,7 +21,7 @@ impl SensorFusion {
             0.0, 0.0, 0.0, // wb
         ]);
         
-        let initial_p = Array2::eye(15) * 1.0;
+        let initial_p = RocketState::initial_covariance();
         
         let mut q = Array2::eye(15);
         for i in 0..3 { q[(i, i)] = 0.01; } // pos
@@ -77,6 +77,16 @@ impl SensorFusion {
             let measurement = Array1::from(vec![pos_val[0], pos_val[1], pos_val[2]]);
             let r_matrix = Array2::eye(3) * pos_noise;
             self.ekf_es.update(&measurement, &r_matrix);
+        }
+
+        // 3. Magnetometer update step to resolve yaw/attitude observability
+        if let Some(imu) = &sensor_data.imu_data {
+            let measurement = Array1::from(vec![imu.mag[0], imu.mag[1], imu.mag[2]]);
+            let mag_world = RocketState::mag_world();
+            let prediction = RocketState::mag_prediction(&self.ekf_es.nominal_state, &mag_world);
+            let h = RocketState::mag_jacobian(&self.ekf_es.nominal_state, &mag_world);
+            let r_mag = Array2::eye(3) * (14.0e-9_f64).powi(2);
+            self.ekf_es.update_with(&measurement, &prediction, &h, &r_mag);
         }
 
         // 3. Extract and construct VehicleState

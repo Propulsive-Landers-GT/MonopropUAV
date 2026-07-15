@@ -9,6 +9,7 @@ pub struct FlightStateMachine {
     sensor_fusion: Box<dyn SensorFusionEstimator>,
     guidance: Box<dyn GuidancePlanner>,
     controller: Box<dyn Controller>,
+    rcs_controller: crate::algorithms::rcs::RcsController,
     state: ControlLoopState,
     goal: [f64; 3],
     sensor_fusion_rate: f64,
@@ -35,6 +36,7 @@ impl FlightStateMachine {
             sensor_fusion: Box::new(SensorFusion::new()),
             guidance: Box::new(lossless),
             controller: Box::new(mpc),
+            rcs_controller: crate::algorithms::rcs::RcsController::new(),
             state: ControlLoopState::default(),
             goal: [0.0, 0.0, 50.0], // The ascent target. The descent targets the origin [0.0, 0.0, 0.0] as the landing pad.
             sensor_fusion_rate: 500.0,
@@ -55,6 +57,7 @@ impl FlightStateMachine {
             sensor_fusion,
             guidance,
             controller,
+            rcs_controller: crate::algorithms::rcs::RcsController::new(),
             state: ControlLoopState::default(),
             goal: [0.0, 0.0, 50.0],
             sensor_fusion_rate: 500.0,
@@ -83,6 +86,7 @@ impl FlightStateMachine {
         if self.state.flight_phase == FlightPhase::Standby {
             self.state.flight_phase = FlightPhase::Armed;
             self.state.last_state_time = now;
+            self.controller.set_flight_phase(self.state.flight_phase);
             println!("Command received: ARMED");
         }
     }
@@ -91,6 +95,7 @@ impl FlightStateMachine {
         if self.state.flight_phase == FlightPhase::Armed {
             self.state.flight_phase = FlightPhase::Standby;
             self.state.last_state_time = now;
+            self.controller.set_flight_phase(self.state.flight_phase);
             println!("Command received: DISARMED");
         }
     }
@@ -99,8 +104,15 @@ impl FlightStateMachine {
         if self.state.flight_phase == FlightPhase::Armed {
             self.state.flight_phase = FlightPhase::Ascent;
             self.state.last_state_time = now;
+            self.controller.set_flight_phase(self.state.flight_phase);
             println!("Command received: LAUNCHED");
         }
+    }
+
+    pub fn set_flight_phase(&mut self, phase: FlightPhase, now: f64) {
+        self.state.flight_phase = phase;
+        self.state.last_state_time = now;
+        self.controller.set_flight_phase(phase);
     }
     
     #[inline]
@@ -116,7 +128,7 @@ impl FlightStateMachine {
         &mut self.state
     }
     
-    pub fn step(&mut self, sensor_data: &SensorData) -> Option<[f64; 3]> {
+    pub fn step(&mut self, sensor_data: &SensorData) -> Option<[f64; 4]> {
         if self.state.flight_terminated {
             return None;
         }
@@ -160,6 +172,7 @@ impl FlightStateMachine {
         self.state.flight_phase = self.determine_flight_phase(self.goal, now);
         if self.state.flight_phase != old_phase {
             self.state.diagnostics_queue.push(format!("Flight phase transition: {:?} -> {:?}", old_phase, self.state.flight_phase));
+            self.controller.set_flight_phase(self.state.flight_phase);
         }
         
         // Centralized scheduling for Guidance planner (1 Hz)
@@ -169,27 +182,32 @@ impl FlightStateMachine {
         
         // Centralized scheduling for MPC (50 Hz)
         if self.state.flight_phase == FlightPhase::Standby || self.state.flight_phase == FlightPhase::Armed || self.state.flight_phase == FlightPhase::Landed {
-            if Self::due(self.state.last_mpc_update, now, self.mpc_rate) {
-                self.state.last_mpc_update = now;
-                return Some([0.0, 0.0, 0.0]); // zero gimbal/thrust
-            }
-            return None;
-        }
-        
-        if Self::due(self.state.last_mpc_update, now, self.mpc_rate) {
+            self.state.last_gimbal_theta = 0.0;
+            self.state.last_gimbal_phi = 0.0;
+            self.state.last_thrust = 0.0;
+        } else if Self::due(self.state.last_mpc_update, now, self.mpc_rate) {
             self.state.last_mpc_update = now;
-            if let Some(control_output) = self.update_mpc(now) {
-                return Some(control_output);
-            }
+            let _ = self.update_mpc(now);
         }
-        
-        None
+
+        // Run RCS controller (roll control)
+        let (_, _, roll) = self.state.vehicle_state.attitude.euler_angles();
+        let roll_rate = self.state.vehicle_state.angular_velocity.z;
+        let rcs_command = self.rcs_controller.update(roll, roll_rate, now);
+
+        Some([
+            self.state.last_gimbal_theta,
+            self.state.last_gimbal_phi,
+            self.state.last_thrust,
+            rcs_command,
+        ])
     }
     
     fn update_sensor_fusion(&mut self, sensor_data: &SensorData, now: f64, dt: f64) -> bool {
         let in_prelaunch = self.state.flight_phase == FlightPhase::Standby || self.state.flight_phase == FlightPhase::Armed;
         if let Some(mut updated_state) = self.sensor_fusion.update(sensor_data, dt, in_prelaunch) {
             updated_state.mass = self.state.mass;
+            updated_state.dry_mass = self.state.vehicle_state.dry_mass;
             self.state.sensor_fusion_state = self.sensor_fusion.get_state_vector();
             self.state.vehicle_state = updated_state;
         }
@@ -229,53 +247,74 @@ impl FlightStateMachine {
     }
     
     fn update_mpc(&mut self, now: f64) -> Option<[f64; 3]> {
-        if let Some(trajectory) = &self.state.trajectory_state {
-            let mpc_state = self.vehicle_state_to_mpc_state();
-            let (xref_traj, uref_traj) = self.generate_mpc_reference(trajectory, now);
-            
-            if let Ok(control_sequence) = self.controller.update(&mpc_state, &xref_traj, &uref_traj, &self.previous_control, self.state.mass) {
-                if let Some(first_control) = control_sequence.first() {
-                    let mut gimbal_theta = first_control[0];
-                    let mut gimbal_phi = first_control[1];
-                    let mut thrust = first_control[2];
-                    
-                    if gimbal_theta.is_nan() || gimbal_theta.is_infinite() ||
-                       gimbal_phi.is_nan() || gimbal_phi.is_infinite() ||
-                       thrust.is_nan() || thrust.is_infinite() {
-                        println!("Warning: MPC returned NaN/Inf! Falling back to last valid control.");
-                        gimbal_theta = self.state.last_gimbal_theta;
-                        gimbal_phi = self.state.last_gimbal_phi;
-                        thrust = self.state.last_thrust;
-                    }
-                    
-                    let max_gimbal_step = 2.0_f64.to_radians();
-                    let max_thrust_step = 40.0;
-                    
-                    let delta_theta = (gimbal_theta - self.state.last_gimbal_theta).clamp(-max_gimbal_step, max_gimbal_step);
-                    gimbal_theta = self.state.last_gimbal_theta + delta_theta;
-                    
-                    let delta_phi = (gimbal_phi - self.state.last_gimbal_phi).clamp(-max_gimbal_step, max_gimbal_step);
-                    gimbal_phi = self.state.last_gimbal_phi + delta_phi;
-                    
-                    let delta_thrust = (thrust - self.state.last_thrust).clamp(-max_thrust_step, max_thrust_step);
-                    thrust = self.state.last_thrust + delta_thrust;
-                    
-                    self.state.last_gimbal_theta = gimbal_theta;
-                    self.state.last_gimbal_phi = gimbal_phi;
-                    self.state.last_thrust = thrust;
-                    
-                    if control_sequence.len() > 1 {
-                        let mut shifted = control_sequence[1..].to_vec();
-                        if let Some(last) = shifted.last().cloned() {
-                            shifted.push(last);
-                        }
-                        self.previous_control = shifted;
-                    } else {
-                        self.previous_control = control_sequence;
-                    }
-                    
-                    return Some([gimbal_theta, gimbal_phi, thrust]);
+        let mpc_state = self.vehicle_state_to_mpc_state();
+
+        let (xref_traj, uref_traj) = if let Some(trajectory) = &self.state.trajectory_state {
+            self.generate_mpc_reference(trajectory, now)
+        } else if self.state.flight_phase == FlightPhase::Hover {
+            let horizon_steps = self.controller.get_horizon_steps();
+            let mut xrefs = Vec::new();
+            let mut urefs = Vec::new();
+            for _ in 0..=horizon_steps {
+                xrefs.push(Array1::from(vec![
+                    self.goal[0], self.goal[1], self.goal[2], // target pos: [0.0, 0.0, 50.0]
+                    0.0, 0.0, 0.0, 1.0,                      // target att: upright
+                    0.0, 0.0, 0.0,                            // target vel: [0, 0, 0]
+                    0.0, 0.0, 0.0                             // target ang vel: [0, 0, 0]
+                ]));
+                urefs.push(Array1::from(vec![0.0, 0.0, self.state.mass * 9.81]));
+            }
+            urefs.truncate(horizon_steps);
+            (xrefs, urefs)
+        } else {
+            return None;
+        };
+        
+        if let Ok(control_sequence) = self.controller.update(&mpc_state, &xref_traj, &uref_traj, &self.previous_control, self.state.mass) {
+            if let Some(first_control) = control_sequence.first() {
+                println!("FSM: MPC state z: {:.3}, att: [{:.3}, {:.3}, {:.3}, {:.3}], vel: [{:.3}, {:.3}, {:.3}]", 
+                         mpc_state[2], mpc_state[3], mpc_state[4], mpc_state[5], mpc_state[6], mpc_state[7], mpc_state[8], mpc_state[9]);
+                println!("FSM: MPC output control: {:?}", first_control);
+                let mut gimbal_theta = first_control[0];
+                let mut gimbal_phi = first_control[1];
+                let mut thrust = first_control[2];
+                
+                if gimbal_theta.is_nan() || gimbal_theta.is_infinite() ||
+                   gimbal_phi.is_nan() || gimbal_phi.is_infinite() ||
+                   thrust.is_nan() || thrust.is_infinite() {
+                    println!("Warning: MPC returned NaN/Inf! Falling back to last valid control.");
+                    gimbal_theta = self.state.last_gimbal_theta;
+                    gimbal_phi = self.state.last_gimbal_phi;
+                    thrust = self.state.last_thrust;
                 }
+                
+                let max_gimbal_step = 2.0_f64.to_radians();
+                let max_thrust_step = 40.0;
+                
+                let delta_theta = (gimbal_theta - self.state.last_gimbal_theta).clamp(-max_gimbal_step, max_gimbal_step);
+                gimbal_theta = self.state.last_gimbal_theta + delta_theta;
+                
+                let delta_phi = (gimbal_phi - self.state.last_gimbal_phi).clamp(-max_gimbal_step, max_gimbal_step);
+                gimbal_phi = self.state.last_gimbal_phi + delta_phi;
+                
+                let delta_thrust = (thrust - self.state.last_thrust).clamp(-max_thrust_step, max_thrust_step);
+                thrust = self.state.last_thrust + delta_thrust;
+                
+                self.state.last_gimbal_theta = gimbal_theta;
+                self.state.last_gimbal_phi = gimbal_phi;
+                self.state.last_thrust = thrust;
+                
+                if control_sequence.len() > 1 {
+                    let mut shifted = control_sequence[1..].to_vec();
+                    if let Some(last) = shifted.last().cloned() {
+                        shifted.push(last);
+                    }
+                    self.previous_control = shifted;
+                } else {
+                    self.previous_control = control_sequence;
+                }
+                
+                return Some([gimbal_theta, gimbal_phi, thrust]);
             }
         }
         None
@@ -335,6 +374,8 @@ impl FlightStateMachine {
         let goal_position = self.goal;
         let propellant_mass = self.state.mass - self.state.vehicle_state.dry_mass;
         
+        self.guidance.configure(50.0, 300.0, self.state.vehicle_state.dry_mass);
+        
         if let Some(trajectory) = self.guidance.solve(
             [current_pos.x, current_pos.y, current_pos.z],
             [current_vel.x, current_vel.y, current_vel.z],
@@ -356,8 +397,10 @@ impl FlightStateMachine {
     fn generate_descent_trajectory(&mut self, now: f64) {
         let current_pos = self.state.vehicle_state.position;
         let current_vel = self.state.vehicle_state.velocity;
-        let landing_point = [0.0, 0.0, 0.0];
+        let landing_point = [0.0, 0.0, 2.0];
         let propellant_mass = self.state.mass - self.state.vehicle_state.dry_mass;
+        
+        self.guidance.configure(15.0, 300.0, self.state.vehicle_state.dry_mass);
         
         if let Some(trajectory) = self.guidance.solve(
             [current_pos.x, current_pos.y, current_pos.z],
@@ -493,7 +536,10 @@ impl FlightStateMachine {
                 
                 let thrust_idx = base_idx.min(trajectory.thrusts.len().saturating_sub(1));
                 if thrust_idx < trajectory.thrusts.len() {
-                    interp_u = trajectory.thrusts[thrust_idx];
+                    let u = trajectory.thrusts[thrust_idx];
+                    let m = if thrust_idx < trajectory.masses.len() { trajectory.masses[thrust_idx] } else { self.state.mass };
+                    let thrust_n = (u[0].powi(2) + u[1].powi(2) + u[2].powi(2)).sqrt() * m;
+                    interp_u = [0.0, 0.0, thrust_n];
                 } else {
                     interp_u = [0.0, 0.0, self.state.mass * 9.81];
                 }

@@ -10,6 +10,8 @@ pub struct Lossless {
     pub tvc_range_rad: f64,
     pub coarse_delta_t: f64,
     pub fine_delta_t: f64,
+    pub coarse_line_search_delta_t: f64,
+    pub fine_line_search_delta_t: f64,
     pub glide_slope: f64,
     pub use_glide_slope: bool,
     pub flip_glide_slope: bool,
@@ -17,14 +19,16 @@ pub struct Lossless {
 
 impl Lossless {
     pub fn new() -> Self {
-        let max_velocity = 5.0;
-        let dry_mass = 10.0;
+        let max_velocity = 50.0;
+        let dry_mass = 61.0;
         let alpha = 1.0 / (9.81 * 180.0);
-        let lower_thrust_bound = 0.0;
-        let upper_thrust_bound = 50.0;
+        let lower_thrust_bound = 300.0;
+        let upper_thrust_bound = 1000.0;
         let tvc_range_rad = 15_f64.to_radians();
-        let coarse_delta_t = 0.25;
-        let fine_delta_t = 0.1;
+        let coarse_delta_t = 0.5;
+        let fine_delta_t = 0.2;
+        let coarse_line_search_delta_t = 0.5;
+        let fine_line_search_delta_t = 0.2;
         let glide_slope = 0.05_f64.to_radians();
         let use_glide_slope = true;
         let flip_glide_slope = true;
@@ -38,6 +42,8 @@ impl Lossless {
             tvc_range_rad,
             coarse_delta_t,
             fine_delta_t,
+            coarse_line_search_delta_t,
+            fine_line_search_delta_t,
             glide_slope,
             use_glide_slope,
             flip_glide_slope,
@@ -56,6 +62,8 @@ impl Lossless {
             lower_thrust_bound: self.lower_thrust_bound,
             upper_thrust_bound: self.upper_thrust_bound,
             tvc_range_rad: self.tvc_range_rad,
+            coarse_line_search_delta_t: self.coarse_line_search_delta_t,
+            fine_line_search_delta_t: self.fine_line_search_delta_t,
             coarse_delta_t: self.coarse_delta_t,
             fine_delta_t: self.fine_delta_t,
             use_bottom_glide_slope: self.use_glide_slope,
@@ -73,5 +81,11 @@ impl Lossless {
 impl GuidancePlanner for Lossless {
     fn solve(&mut self, current_position: [f64; 3], current_velocity: [f64; 3], target_position: [f64; 3], propellant_mass: f64) -> Option<rust_lossless::TrajectoryResult> {
         self.solve(current_position, current_velocity, target_position, propellant_mass)
+    }
+
+    fn configure(&mut self, max_velocity: f64, lower_thrust_bound: f64, dry_mass: f64) {
+        self.max_velocity = max_velocity;
+        self.lower_thrust_bound = lower_thrust_bound;
+        self.dry_mass = dry_mass;
     }
 }

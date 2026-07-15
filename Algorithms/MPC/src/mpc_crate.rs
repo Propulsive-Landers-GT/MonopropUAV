@@ -206,7 +206,7 @@ pub fn dynamics(x: &Array1<f64>, u: &Array1<f64>, mass: f64, moi: &Array2<f64>, 
     let z_ddot = acc[2];
 
     // TVC torque
-    let d = 0.663834203726; // TODO: make ts customizable
+    let d = 0.286; // TODO: make ts customizable
     let r_cp = Array1::from(vec![0.0, 0.0, -d]);
     let torque_b = Array1::from(vec![
         r_cp[1] * thrust_b[2] - r_cp[2] * thrust_b[1],
@@ -340,7 +340,7 @@ fn build_Su(A_seq: &Vec<Array2<f64>>, B_seq: &Vec<Array2<f64>>) -> Array2<f64> {
         for j in 0..=k {
             let mut Phi = Array2::<f64>::eye(n);
             if j + 1 <= k {
-                for t in (j+1)..k {
+                for t in (j+1)..=k {
                     Phi = Phi.dot(&A_seq[t]);
                 }
             }
@@ -408,19 +408,24 @@ fn assemble_qp_increment(xs: &Vec<Array1<f64>>, U: &Vec<Array1<f64>>, xref_traj:
 
     H = 0.5 * (H.clone() + H.t()) + 1e-8 * Array2::<f64>::eye(H.nrows()); // ensure symmetry and positive definiteness
 
+    println!("DEBUG MPC: r norm = {:.3}, Su norm = {:.3}, g norm = {:.3}", r.norm(), Su.norm(), g.norm());
+
     (H, g, dU_min, dU_max, Su, Q_bar, R_bar)
 }
 
-fn solve_qp_pgd(H: &Array2<f64>, g: &Array1<f64>, dU_min: &Array1<f64>, dU_max: &Array1<f64>, dU_init: &Array1<f64>, max_iters: usize, alpha: f64) -> Array1<f64> {
+fn solve_qp_pgd(H: &Array2<f64>, g: &Array1<f64>, dU_min: &Array1<f64>, dU_max: &Array1<f64>, dU_init: &Array1<f64>, max_iters: usize, _alpha: f64) -> Array1<f64> {
     let mut dU = dU_init.clone();
     let n = dU.len();
+    let alpha = 1.0;
     
     // Initial projection to ensure feasibility
     for i in 0..n {
         dU[i] = dU[i].max(dU_min[i]).min(dU_max[i]);
     }
 
-    for iter in 0..max_iters {
+    let h_diag = H.diag().to_owned();
+
+    for _iter in 0..max_iters {
         // Compute gradient
         let grad = H.dot(&dU) + g;
         let grad_norm = grad.norm();
@@ -431,11 +436,11 @@ fn solve_qp_pgd(H: &Array2<f64>, g: &Array1<f64>, dU_min: &Array1<f64>, dU_max: 
 
         let cost_old = 0.5 * dU.t().dot(H).dot(&dU) + g.t().dot(&dU);
         
-        // Try full step first
-        let mut dU_new = &dU - &(alpha * &grad);
-        
-        // Project to bounds
+        // Try full step first with Jacobi preconditioning
+        let mut dU_new = dU.clone();
         for i in 0..n {
+            let h_val = h_diag[i].max(1e-8);
+            dU_new[i] = dU[i] - alpha * grad[i] / h_val;
             dU_new[i] = dU_new[i].max(dU_min[i]).min(dU_max[i]);
         }
         
@@ -447,11 +452,10 @@ fn solve_qp_pgd(H: &Array2<f64>, g: &Array1<f64>, dU_min: &Array1<f64>, dU_max: 
         
         if cost_new >= cost_old {
             alpha_ls = alpha;
-            while alpha_ls > 1e-6 {
-                dU_candidate = &dU - &(alpha_ls * &grad);
-                
-                // Project to bounds
+            while alpha_ls > 1e-20 {
                 for i in 0..n {
+                    let h_val = h_diag[i].max(1e-8);
+                    dU_candidate[i] = dU[i] - alpha_ls * grad[i] / h_val;
                     dU_candidate[i] = dU_candidate[i].max(dU_min[i]).min(dU_max[i]);
                 }
                 
@@ -473,8 +477,6 @@ fn solve_qp_pgd(H: &Array2<f64>, g: &Array1<f64>, dU_min: &Array1<f64>, dU_max: 
             // No improvement, break early
             break;
         }
-        
-        // println!("Iter {}: grad_norm = {:.6}, cost = {:.6}", iter, grad_norm, cost_old);
     }
 
     dU
@@ -522,6 +524,7 @@ fn nmpc_step(x0: &Array1<f64>, U_init: &Vec<Array1<f64>>, xref_traj: &Vec<Array1
         }
         let J0 = true_cost(x0, &U, xref_traj, Q, R, QN, mass, moi, dt);
         let mut step = 1.0;
+        let mut found = false;
         while step > 1e-3 {
             let U_try_flat = &flatU + &(step * &dU);
             // Reshape U_try_flat into U_try (Vec<Array1<f64>>)
@@ -537,9 +540,13 @@ fn nmpc_step(x0: &Array1<f64>, U_init: &Vec<Array1<f64>>, xref_traj: &Vec<Array1
             let Jtry = true_cost(x0, &U_try, xref_traj, Q, R, QN, mass, moi, dt);
             if Jtry < J0 {
                 U = U_try;
+                found = true;
                 break;
             }
             step *= 0.5;
+        }
+        if !found {
+            println!("MPC line search failed: J0 = {:.3}, dU norm = {:.6}, dU = {:?}", J0, dU.norm(), dU);
         }
 
         // test for convergence ?
@@ -644,6 +651,14 @@ pub fn OpEnSolve(
     let (H, g, _dU_min, _dU_max, _Su, _Q_bar, _R_bar) =
         assemble_qp_increment(&xs, U, xref_traj, &A_seq, &B_seq, Q, R, QN,
                               &Array1::zeros(m), &Array1::zeros(m));
+
+    let g_norm = g.fold(0.0, |sum, &val| sum + val.powi(2)).sqrt();
+    let h_diag = H.diag();
+    let h_mean = h_diag.mean().unwrap_or(0.0);
+    let h_min = h_diag.fold(f64::MAX, |m_val, &v| m_val.min(v));
+    let h_max = h_diag.fold(f64::MIN, |m_val, &v| m_val.max(v));
+    println!("MPC QP DIAG: g_norm={:.4}, H_diag_mean={:.4}, H_diag_min={:.4}, H_diag_max={:.4}", 
+             g_norm, h_mean, h_min, h_max);
 
     // Gradient and cost are in delta-U space: min 0.5 dU^T H dU + g^T dU
     let df = |du_slice: &[f64], grad_slice: &mut [f64]| -> Result<(), SolverError> {
