@@ -1,5 +1,5 @@
 use Lander::fsm::FlightStateMachine;
-use Lander::state::SensorData;
+use Lander::state::{self, SensorData};
 use Lander::mcap_logger::McapLogger;
 use std::sync::mpsc::{self, Receiver};
 
