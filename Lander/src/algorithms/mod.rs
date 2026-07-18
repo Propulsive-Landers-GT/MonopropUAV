@@ -1,7 +1,7 @@
 use ndarray::Array1;
 use crate::state::{SensorData, VehicleState};
 
-pub trait SensorFusionEstimator {
+pub trait Navigator {
     fn update(&mut self, sensor_data: &SensorData, dt: f64, in_prelaunch: bool) -> Option<VehicleState>;
     fn get_state_vector(&self) -> Option<Array1<f64>>;
 }
@@ -34,7 +34,7 @@ pub trait Controller {
 }
 
 // Module declarations
-pub mod sensor_fusion;
+pub mod navigator;
 pub mod guidance;
 pub mod control;
 pub mod rcs;

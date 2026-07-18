@@ -3,14 +3,13 @@ use nalgebra::{Vector3, UnitQuaternion, Quaternion};
 use rust_ekf::es_ekf::filter::ErrorStateKalmanFilter;
 use rust_ekf::models::full_state_esekf::RocketState;
 use crate::state::{SensorData, VehicleState};
-use super::SensorFusionEstimator;
 
-pub struct SensorFusion {
+pub struct Navigator {
     pub ekf_es: ErrorStateKalmanFilter<RocketState>,
     last_update: Option<f64>,
 }
 
-impl SensorFusion {
+impl Navigator {
     pub fn new() -> Self {
         // Nominal state: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, abx, aby, abz, wbx, wby, wbz] (16D)
         let initial_nominal = Array1::from(vec![
@@ -109,7 +108,7 @@ impl SensorFusion {
     }
 }
 
-impl SensorFusionEstimator for SensorFusion {
+impl super::Navigator for Navigator {
     fn update(&mut self, sensor_data: &SensorData, dt: f64, in_prelaunch: bool) -> Option<VehicleState> {
         self.update(sensor_data, dt, in_prelaunch)
     }
